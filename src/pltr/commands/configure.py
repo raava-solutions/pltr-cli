@@ -10,6 +10,12 @@ from rich.prompt import Prompt, Confirm
 from ..auth.storage import CredentialStorage
 from ..auth.base import ProfileNotFoundError
 from ..config.profiles import ProfileManager
+from .mcp import (
+    ClaudeMcpSyncError,
+    OmpMcpSyncError,
+    sync_claude_mcp,
+    sync_omp_mcp,
+)
 
 app = typer.Typer()
 console = Console()
@@ -89,10 +95,11 @@ def configure(
     console.print(f"[green]✓[/green] Profile '{profile}' configured successfully")
 
 
-@app.command()
+@app.command(name="list")
 def list_profiles():
     """List all configured profiles."""
     profile_manager = ProfileManager()
+    storage = CredentialStorage()
     profiles = profile_manager.list_profiles()
     default = profile_manager.get_default()
 
@@ -101,19 +108,34 @@ def list_profiles():
         console.print("Run 'pltr configure' to set up your first profile.")
         return
 
-    console.print("[bold]Configured profiles:[/bold]")
+    from rich.table import Table
+
+    table = Table(title="Configured Profiles")
+    table.add_column("Default", justify="center")
+    table.add_column("Profile Name", style="cyan")
+    table.add_column("Host URL", style="magenta")
+    table.add_column("Auth Type", style="green")
+
     for profile in profiles:
-        if profile == default:
-            console.print(f"  * {profile} [green](default)[/green]")
-        else:
-            console.print(f"    {profile}")
+        is_default = "✓" if profile == default else ""
+        try:
+            creds = storage.get_profile(profile)
+            host = creds.get("host", "Unknown")
+            auth_type = creds.get("auth_type", "Unknown")
+        except ProfileNotFoundError:
+            host = "Error loading credentials"
+            auth_type = "Unknown"
+
+        table.add_row(is_default, profile, host, auth_type)
+
+    console.print(table)
 
 
 @app.command()
 def set_default(
     profile: str = typer.Argument(..., help="Profile name to set as default"),
 ):
-    """Set a profile as the default."""
+    """Set the default profile and sync Claude Code/OMP MCP pairing."""
     profile_manager = ProfileManager()
 
     if profile not in profile_manager.list_profiles():
@@ -122,6 +144,29 @@ def set_default(
 
     profile_manager.set_default(profile)
     console.print(f"[green]✓[/green] Profile '{profile}' set as default")
+
+    try:
+        sync_omp_mcp(profile)
+    except OmpMcpSyncError as exc:
+        console.print(f"[yellow]Warning:[/yellow] {exc}")
+    else:
+        console.print("[green]✓[/green] OMP MCP config synchronized")
+
+    try:
+        sync_claude_mcp(profile)
+    except ClaudeMcpSyncError as exc:
+        console.print(f"[yellow]Warning:[/yellow] {exc}")
+    else:
+        console.print("[green]✓[/green] Claude Code MCP registration synchronized")
+
+
+@app.command(name="use")
+def use_profile(
+    profile: str = typer.Argument(..., help="Profile name to use as default"),
+):
+    """Alias for set-default. Switch to another profile."""
+    # This just calls the same logic as set_default
+    set_default(profile)
 
 
 @app.command()

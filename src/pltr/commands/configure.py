@@ -10,6 +10,12 @@ from rich.prompt import Prompt, Confirm
 from ..auth.storage import CredentialStorage
 from ..auth.base import ProfileNotFoundError
 from ..config.profiles import ProfileManager
+from .mcp import (
+    ClaudeMcpSyncError,
+    OmpMcpSyncError,
+    sync_claude_mcp,
+    sync_omp_mcp,
+)
 
 app = typer.Typer()
 console = Console()
@@ -129,7 +135,7 @@ def list_profiles():
 def set_default(
     profile: str = typer.Argument(..., help="Profile name to set as default"),
 ):
-    """Set a profile as the default."""
+    """Set the default profile and sync Claude Code/OMP MCP pairing."""
     profile_manager = ProfileManager()
 
     if profile not in profile_manager.list_profiles():
@@ -138,6 +144,20 @@ def set_default(
 
     profile_manager.set_default(profile)
     console.print(f"[green]✓[/green] Profile '{profile}' set as default")
+
+    try:
+        sync_omp_mcp(profile)
+    except OmpMcpSyncError as exc:
+        console.print(f"[yellow]Warning:[/yellow] {exc}")
+    else:
+        console.print("[green]✓[/green] OMP MCP config synchronized")
+
+    try:
+        sync_claude_mcp(profile)
+    except ClaudeMcpSyncError as exc:
+        console.print(f"[yellow]Warning:[/yellow] {exc}")
+    else:
+        console.print("[green]✓[/green] Claude Code MCP registration synchronized")
 
 
 @app.command(name="use")

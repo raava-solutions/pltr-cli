@@ -1,6 +1,8 @@
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import typer
 from pathlib import Path
 from typing import Optional
@@ -10,10 +12,21 @@ from ..auth.storage import CredentialStorage
 from ..config.profiles import ProfileManager
 from ..utils.completion import complete_profile
 
-app = typer.Typer(help="Manage Palantir MCP server integration")
+app = typer.Typer(
+    help="Manage project-local MCP configs and Claude Code/OMP user-level pairing"
+)
 console = Console(stderr=True)
 
 PLTR_MCP_KEY = "palantir-mcp"
+CLAUDE_MCP_NAME = "palantir-foundry"
+
+
+class ClaudeMcpSyncError(RuntimeError):
+    """Raised when Claude Code's user-level MCP registration cannot be synchronized."""
+
+
+class OmpMcpSyncError(RuntimeError):
+    """Raised when OMP's user-level MCP configuration cannot be synchronized."""
 
 
 def _resolve_pltr_path() -> str:
@@ -38,6 +51,18 @@ def _build_claude_code_mcp_entry(profile: str) -> dict:
     }
 
 
+def _build_omp_mcp_entry(profile: str) -> dict:
+    return {
+        "type": "stdio",
+        "command": _resolve_pltr_path(),
+        "args": ["mcp", "serve", "--profile", profile],
+    }
+
+
+def _omp_mcp_config_path() -> Path:
+    return Path.home() / ".omp" / "agent" / "mcp.json"
+
+
 def _read_json_file(path: Path) -> dict:
     if path.exists():
         with open(path, "r") as f:
@@ -52,6 +77,36 @@ def _write_json_file(path: Path, data: dict) -> None:
         f.write("\n")
 
 
+def _write_json_file_atomic(path: Path, data: dict) -> None:
+    """Atomically replace a JSON file without leaving a partial user config."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp_path: Optional[Path] = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(data, temp_file, indent=2)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        if path.exists():
+            os.chmod(temp_path, path.stat().st_mode & 0o777)
+        else:
+            os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
 def _validate_profile(profile: str) -> None:
     profile_manager = ProfileManager()
     if not profile_manager.profile_exists(profile):
@@ -62,6 +117,91 @@ def _validate_profile(profile: str) -> None:
         else:
             console.print("Run 'pltr configure configure' to create a profile first.")
         raise typer.Exit(1)
+
+
+def sync_claude_mcp(profile: str) -> None:
+    """Synchronize Claude Code's global MCP entry with a local pltr profile."""
+    _validate_profile(profile)
+
+    try:
+        credentials = CredentialStorage().get_profile(profile)
+    except Exception as exc:
+        raise ClaudeMcpSyncError(
+            f"Could not load credentials for profile '{profile}'."
+        ) from exc
+
+    if not credentials.get("host"):
+        raise ClaudeMcpSyncError(f"Profile '{profile}' does not have a Foundry host.")
+    if not credentials.get("token"):
+        raise ClaudeMcpSyncError(f"Profile '{profile}' does not have a bearer token.")
+
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        raise ClaudeMcpSyncError("Claude Code CLI not found in PATH.")
+
+    pltr_path = _resolve_pltr_path()
+
+    try:
+        subprocess.run(
+            [
+                claude_path,
+                "mcp",
+                "remove",
+                CLAUDE_MCP_NAME,
+                "-s",
+                "user",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [
+                claude_path,
+                "mcp",
+                "add",
+                "--transport",
+                "stdio",
+                "-s",
+                "user",
+                CLAUDE_MCP_NAME,
+                "--",
+                pltr_path,
+                "mcp",
+                "serve",
+                "--profile",
+                profile,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ClaudeMcpSyncError(
+            "Claude Code MCP registration could not be synchronized."
+        ) from exc
+
+
+def sync_omp_mcp(profile: str) -> Path:
+    """Synchronize OMP's user-level MCP entry with a local pltr profile."""
+    _validate_profile(profile)
+    config_path = _omp_mcp_config_path()
+
+    try:
+        config = _read_json_file(config_path)
+        if not isinstance(config, dict):
+            raise TypeError("OMP MCP config must be a JSON object")
+        servers = config.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            raise TypeError("mcpServers must be a JSON object")
+        servers[CLAUDE_MCP_NAME] = _build_omp_mcp_entry(profile)
+        _write_json_file_atomic(config_path, config)
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise OmpMcpSyncError(
+            f"OMP MCP config could not be synchronized at '{config_path}'."
+        ) from exc
+
+    return config_path
 
 
 def _update_opencode_config(directory: Path, profile: str) -> Path:
@@ -213,6 +353,43 @@ def init(
         f"\nOpen [bold]OpenCode[/bold] or [bold]Claude Code[/bold] in [cyan]{target}[/cyan] "
         "and the Palantir MCP will connect automatically."
     )
+
+
+@app.command()
+def pair(
+    profile: str = typer.Argument(
+        ...,
+        help="Profile name for Claude Code and OMP user-level MCP pairing",
+        autocompletion=complete_profile,
+    ),
+):
+    """Pair Claude Code and OMP with a profile through the local MCP wrapper."""
+    sync_failed = False
+
+    try:
+        omp_path = sync_omp_mcp(profile)
+    except OmpMcpSyncError as exc:
+        sync_failed = True
+        console.print(f"[yellow]Warning:[/yellow] {exc}")
+    else:
+        console.print(
+            "[green]OMP MCP config synchronized[/green] "
+            f"for profile: [bold]{profile}[/bold] ({omp_path})"
+        )
+
+    try:
+        sync_claude_mcp(profile)
+    except ClaudeMcpSyncError as exc:
+        sync_failed = True
+        console.print(f"[yellow]Warning:[/yellow] {exc}")
+    else:
+        console.print(
+            "[green]Claude Code MCP registration synchronized[/green] "
+            f"for profile: [bold]{profile}[/bold]"
+        )
+
+    if sync_failed:
+        raise typer.Exit(1)
 
 
 @app.command()

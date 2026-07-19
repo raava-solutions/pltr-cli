@@ -123,6 +123,148 @@ def display_openai_response(response: dict, format: str, output: Optional[str]):
         formatter.display(response, format)
 
 
+# ===== Shared Language Model Commands =====
+
+
+@app.command("list")
+def list_models(
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        "-p",
+        help="Profile name",
+        autocompletion=complete_profile,
+    ),
+    format: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format (table, json, csv)",
+        autocompletion=complete_output_format,
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output file path"
+    ),
+):
+    """List available language models for the current enrollment."""
+    try:
+        from ..services.language_models import LanguageModelsService
+
+        service = LanguageModelsService(profile=profile)
+
+        with SpinnerProgressTracker().track_spinner("Fetching available models..."):
+            models = service.list_available_models()
+
+        formatter.format_table(
+            models,
+            columns=["model_rid", "status", "type", "display_name"],
+            format=format,
+            output=output,
+        )
+
+        if output:
+            formatter.print_success(f"Model list saved to {output}")
+
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        formatter.print_error(f"Operation failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command("status")
+def model_status(
+    model_id: str = typer.Argument(
+        ...,
+        help="Model Resource Identifier (ri.language-model-service..language-model.<id>)",
+    ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        "-p",
+        help="Profile name",
+        autocompletion=complete_profile,
+    ),
+    format: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format (table, json, csv)",
+        autocompletion=complete_output_format,
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output file path"
+    ),
+):
+    """Check enrollment status for a language model via direct API fallback endpoints."""
+    try:
+        from ..services.language_models import LanguageModelsService
+
+        service = LanguageModelsService(profile=profile)
+
+        with SpinnerProgressTracker().track_spinner("Checking model status..."):
+            result = service.get_model_enrollment_status(model_id)
+
+        formatter.format_dict(result, format=format, output=output)
+
+        if output:
+            formatter.print_success(f"Model status saved to {output}")
+
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        formatter.print_error(f"Operation failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command("enroll")
+def enroll_model(
+    model_id: str = typer.Argument(
+        ...,
+        help="Model Resource Identifier (ri.language-model-service..language-model.<id>)",
+    ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        "-p",
+        help="Profile name",
+        autocompletion=complete_profile,
+    ),
+    format: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format (table, json, csv)",
+        autocompletion=complete_output_format,
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output file path"
+    ),
+):
+    """Enroll/enable a language model via direct API fallback endpoints."""
+    try:
+        from ..services.language_models import LanguageModelsService
+
+        service = LanguageModelsService(profile=profile)
+
+        with SpinnerProgressTracker().track_spinner("Enrolling model..."):
+            result = service.enroll_model(model_id)
+
+        formatter.format_dict(result, format=format, output=output)
+
+        if output:
+            formatter.print_success(f"Enrollment result saved to {output}")
+
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        formatter.print_error(f"Operation failed: {e}")
+        raise typer.Exit(1)
+
+
 # ===== Anthropic Commands =====
 
 
@@ -323,9 +465,9 @@ def anthropic_messages_advanced(
         # conversation.json:
         # {
         #   "messages": [
-        #     {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
-        #     {"role": "assistant", "content": [{"type": "text", "text": "Hello!"}]},
-        #     {"role": "user", "content": [{"type": "text", "text": "Help me"}]}
+        #     {"role": "USER", "content": [{"type": "text", "text": "Hi"}]},
+        #     {"role": "ASSISTANT", "content": [{"type": "text", "text": "Hello!"}]},
+        #     {"role": "USER", "content": [{"type": "text", "text": "Help me"}]}
         #   ],
         #   "maxTokens": 500
         # }
@@ -334,11 +476,11 @@ def anthropic_messages_advanced(
 
         # Inline JSON with system prompt
         pltr language-models anthropic messages-advanced ri.language-models.main.model.abc123 \\
-            --request '{"messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}], "maxTokens": 100, "system": [{"type": "text", "text": "Be concise"}]}'
+            --request '{"messages": [{"role": "USER", "content": [{"type": "text", "text": "Hi"}]}], "maxTokens": 100, "system": [{"type": "text", "text": "Be concise"}]}'
 
         # With extended thinking
         pltr language-models anthropic messages-advanced ri.language-models.main.model.abc123 \\
-            --request '{"messages": [{"role": "user", "content": [{"type": "text", "text": "Solve this problem"}]}], "maxTokens": 2000, "thinking": {"type": "enabled", "budget": 10000}}'
+            --request '{"messages": [{"role": "USER", "content": [{"type": "text", "text": "Solve this problem"}]}], "maxTokens": 2000, "thinking": {"type": "enabled", "budget": 10000}}'
     """
     try:
         # Parse request JSON

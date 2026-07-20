@@ -33,6 +33,7 @@ from pltr.commands import (
     data_health,
     audit,
     widgets,
+    proposal,
     dependency,
     mcp,
 )
@@ -110,6 +111,11 @@ app.add_typer(
     widgets.app,
     name="widgets",
     help="Manage widget sets, releases, and repositories",
+)
+app.add_typer(
+    proposal.app,
+    name="proposal",
+    help="Manage code pull requests and Ontology Global Proposals",
 )
 app.add_typer(
     admin.app,

@@ -534,6 +534,164 @@ class DatasetService(BaseService):
                 f"Failed to download file {file_path} from dataset {dataset_rid}: {e}"
             )
 
+    def get_dataset_stats(
+        self,
+        dataset_rid: str,
+        branch: str = "master",
+        *,
+        page_size: Optional[int] = None,
+        page_token: Optional[str] = None,
+        max_pages: Optional[int] = 1,
+        fetch_all: bool = False,
+    ) -> Dict[str, Any]:
+        """Compute dataset file and transaction statistics from SDK resources.
+
+        SDK 1.95.0 has no dedicated statistics endpoint.  This method derives
+        statistics only from the documented ``Dataset.File.list`` and
+        ``Dataset.transactions`` APIs and reports bounded/partial coverage
+        instead of presenting a first page as a complete dataset total.
+        """
+        if page_size is not None and page_size <= 0:
+            raise ValueError("page_size must be greater than zero")
+        if max_pages is not None and max_pages <= 0:
+            raise ValueError("max_pages must be greater than zero")
+
+        effective_max_pages = None if fetch_all else max_pages
+        files: List[Any] = []
+        current_token = page_token
+        pages_fetched = 0
+        next_file_token: Optional[str] = None
+
+        try:
+            while True:
+                params: Dict[str, Any] = {
+                    "dataset_rid": dataset_rid,
+                    "branch_name": branch,
+                }
+                if page_size is not None:
+                    params["page_size"] = page_size
+                if current_token is not None:
+                    params["page_token"] = current_token
+                iterator = self.service.Dataset.File.list(**params)
+                page_items, next_file_token = self._read_sdk_page(iterator)
+                files.extend(page_items)
+                pages_fetched += 1
+
+                if next_file_token is None or (
+                    effective_max_pages is not None
+                    and pages_fetched >= effective_max_pages
+                ):
+                    break
+                current_token = next_file_token
+
+            total_size = sum(
+                int(size)
+                for size in (getattr(file, "size_bytes", None) for file in files)
+                if isinstance(size, (int, float)) and size >= 0
+            )
+            hidden_files = [
+                file
+                for file in files
+                if self._is_hidden_path(getattr(file, "path", ""))
+            ]
+
+            transactions: List[Any] = []
+            transaction_next_token: Optional[str] = None
+            transaction_warning: Optional[str] = None
+            try:
+                transaction_iterator = self.service.Dataset.transactions(dataset_rid)
+                transactions, transaction_next_token = self._read_sdk_page(
+                    transaction_iterator
+                )
+            except Exception as e:
+                transaction_warning = (
+                    "Transaction statistics are unavailable: "
+                    f"{self._format_error_detail(e)}"
+                )
+
+            warnings: List[str] = []
+            if next_file_token is not None:
+                warnings.append(
+                    "File statistics are partial; use pagination.next_page_token "
+                    "or --fetch-all to continue."
+                )
+            warnings.append(
+                "Transaction statistics cover the dataset history because the "
+                "SDK transaction endpoint has no branch filter; file statistics "
+                f"are scoped to branch '{branch}'."
+            )
+            if transaction_next_token is not None:
+                warnings.append(
+                    "Transaction statistics are partial; the SDK returned more "
+                    "transaction pages."
+                )
+            if transaction_warning:
+                warnings.append(transaction_warning)
+
+            stats: Dict[str, Any] = {
+                "dataset_rid": dataset_rid,
+                "branch": branch,
+                "file_count": len(files),
+                "hidden_file_count": len(hidden_files),
+                "size_bytes": total_size,
+                "total_size_bytes": total_size,
+                "transaction_scope": "dataset",
+                "transaction_count": len(transactions),
+                "transaction_rids": [
+                    getattr(transaction, "rid", None) for transaction in transactions
+                ],
+                "latest_transaction_rid": (
+                    getattr(transactions[0], "rid", None) if transactions else None
+                ),
+                "coverage": "partial",
+                "warnings": warnings,
+                "pagination": {
+                    "files": {
+                        "pages_fetched": pages_fetched,
+                        "items_fetched": len(files),
+                        "has_more": next_file_token is not None,
+                        "next_page_token": next_file_token,
+                    },
+                    "transactions": {
+                        "has_more": transaction_next_token is not None,
+                        "next_page_token": transaction_next_token,
+                    },
+                },
+            }
+            return stats
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to get statistics for dataset {dataset_rid}: "
+                f"{self._format_error_detail(e)}"
+            )
+
+    @staticmethod
+    def _read_sdk_page(iterator: Any) -> tuple[List[Any], Optional[str]]:
+        page_data = getattr(iterator, "data", None)
+        if page_data is not None and not isinstance(page_data, (list, tuple)):
+            raise TypeError("SDK page data must be a list")
+        if isinstance(page_data, (list, tuple)):
+            raw_items = list(page_data)
+        else:
+            if isinstance(iterator, (str, bytes, dict)):
+                raise TypeError("SDK page response must be an iterator")
+            raw_items = list(iterator)
+        next_token = getattr(iterator, "next_page_token", None)
+        if not isinstance(next_token, str) or not next_token:
+            next_token = None
+        return raw_items, next_token
+
+    @staticmethod
+    def _is_hidden_path(path: Any) -> bool:
+        return any(part.startswith(".") for part in str(path or "").split("/"))
+
+    @staticmethod
+    def _format_error_detail(error: Exception) -> str:
+        message = str(error).strip()
+        if message:
+            return message
+        return error.__class__.__name__
+
     def list_files(
         self, dataset_rid: str, branch: str = "master"
     ) -> List[Dict[str, Any]]:

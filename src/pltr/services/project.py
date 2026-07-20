@@ -5,11 +5,16 @@ Project service wrapper for Foundry SDK filesystem API.
 from typing import Any, Optional, Dict, List
 import inspect
 
+from ..utils.pagination import PaginationMetadata, PaginationResult
 from .base import BaseService
 
 
 class ProjectService(BaseService):
     """Service wrapper for Foundry project operations using filesystem API."""
+
+    MAX_SEARCH_SPACES = 1000
+    MAX_SEARCH_RESOURCES = 100000
+    MAX_SEARCH_PROJECTS = 10000
 
     def _get_service(self) -> Any:
         """Get the Foundry filesystem service."""
@@ -232,6 +237,221 @@ class ProjectService(BaseService):
             return self._format_project_info(project)
         except Exception as e:
             raise RuntimeError(f"Failed to update project {project_rid}: {e}")
+
+    def get_project_imports(
+        self,
+        project_rid: str,
+        reference_type: Optional[str] = None,
+        page_size: Optional[int] = None,
+        page_token: Optional[str] = None,
+    ) -> PaginationResult:
+        """List resources imported/referenced by a project.
+
+        ``Project.Reference.list`` is the SDK's documented project-import
+        contract.  The SDK calls these records ``references`` because they may
+        point to either a filesystem resource or an external resource.
+        """
+        if reference_type is not None:
+            reference_type = reference_type.upper()
+            if reference_type not in {"EXTERNAL", "FILESYSTEM"}:
+                raise ValueError("reference_type must be EXTERNAL or FILESYSTEM")
+
+        try:
+            params: Dict[str, Any] = {}
+            if page_size is not None:
+                params["page_size"] = page_size
+            if page_token is not None:
+                params["page_token"] = page_token
+            if reference_type is not None:
+                params["reference_type"] = reference_type
+
+            iterator = self.service.Project.Reference.list(project_rid, **params)
+            raw_items, next_token = self._read_sdk_page(iterator)
+            imports = [self._format_project_import(item) for item in raw_items]
+            return PaginationResult(
+                data=imports,
+                metadata=PaginationMetadata(
+                    current_page=1,
+                    items_fetched=len(imports),
+                    next_page_token=next_token,
+                    has_more=next_token is not None,
+                    total_pages_fetched=1,
+                ),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to list imports for project {project_rid}: {self._format_error_detail(e)}"
+            )
+
+    def search_projects(
+        self,
+        query: str,
+        *,
+        space_rid: Optional[str] = None,
+        page_size: Optional[int] = None,
+        page_token: Optional[str] = None,
+    ) -> PaginationResult:
+        """Search project metadata using verified filesystem list APIs.
+
+        The SDK exposes no server-side project search endpoint.  This method
+        therefore lists projects in visible Spaces and applies matching to
+        project metadata locally. The continuation token is a keyset cursor
+        over sorted project RIDs, not a fabricated Foundry API token; it avoids
+        offset shifts when resources are added or removed between requests.
+        """
+        normalized_query = query.strip().lower()
+        if not normalized_query:
+            raise ValueError("query must not be empty")
+
+        after_rid = self._parse_search_token(page_token)
+        limit = page_size if page_size is not None else 50
+        if limit <= 0:
+            raise ValueError("page_size must be greater than zero")
+        if limit > 1000:
+            raise ValueError("page_size must not exceed 1000")
+
+        try:
+            candidates: List[Dict[str, Any]] = []
+            for resource in self._iter_project_candidates(space_rid):
+                project = self._format_project_info(resource)
+                searchable = " ".join(
+                    str(project.get(field) or "")
+                    for field in ("rid", "display_name", "description", "path")
+                ).lower()
+                if normalized_query in searchable:
+                    candidates.append(project)
+
+            candidates.sort(key=lambda item: str(item.get("rid") or ""))
+            candidates = [
+                candidate
+                for candidate in candidates
+                if str(candidate.get("rid") or "") > after_rid
+            ]
+            page = candidates[:limit]
+            last_rid = str(page[-1].get("rid") or "") if page else ""
+            next_token = (
+                f"project-search-after:{last_rid}"
+                if last_rid
+                and len(page) == limit
+                and any(
+                    str(candidate.get("rid") or "") > last_rid
+                    for candidate in candidates
+                )
+                else None
+            )
+            return PaginationResult(
+                data=page,
+                metadata=PaginationMetadata(
+                    current_page=1,
+                    items_fetched=len(page),
+                    next_page_token=next_token,
+                    has_more=next_token is not None,
+                    total_pages_fetched=1,
+                ),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to search projects for '{query}': {self._format_error_detail(e)}"
+            )
+
+    def _iter_project_candidates(self, space_rid: Optional[str]) -> List[Any]:
+        """Collect visible direct project children using SDK list contracts."""
+        if space_rid:
+            space_candidates = []
+            resources_seen = 0
+            for resource in self.service.Folder.children(space_rid):
+                resources_seen += 1
+                if resources_seen > self.MAX_SEARCH_RESOURCES:
+                    raise RuntimeError(
+                        "Project search exceeded the resource scan limit "
+                        f"({self.MAX_SEARCH_RESOURCES}); narrow the search and retry."
+                    )
+                if self._is_project_resource(resource):
+                    space_candidates.append(resource)
+            if len(space_candidates) > self.MAX_SEARCH_PROJECTS:
+                raise RuntimeError(
+                    "Project search exceeded the project scan limit "
+                    f"({self.MAX_SEARCH_PROJECTS}); narrow the search and retry."
+                )
+            return space_candidates
+
+        candidates: List[Any] = []
+        spaces_seen = 0
+        resources_seen = 0
+        for space in self.service.Space.list():
+            spaces_seen += 1
+            if spaces_seen > self.MAX_SEARCH_SPACES:
+                raise RuntimeError(
+                    "Project search exceeded the visible Space scan limit "
+                    f"({self.MAX_SEARCH_SPACES}); provide --space-rid and retry."
+                )
+            current_space_rid = getattr(space, "rid", None)
+            if not current_space_rid:
+                continue
+            for resource in self.service.Folder.children(current_space_rid):
+                resources_seen += 1
+                if resources_seen > self.MAX_SEARCH_RESOURCES:
+                    raise RuntimeError(
+                        "Project search exceeded the resource scan limit "
+                        f"({self.MAX_SEARCH_RESOURCES}); provide --space-rid and retry."
+                    )
+                if not self._is_project_resource(resource):
+                    continue
+                candidates.append(resource)
+                if len(candidates) > self.MAX_SEARCH_PROJECTS:
+                    raise RuntimeError(
+                        "Project search exceeded the project scan limit "
+                        f"({self.MAX_SEARCH_PROJECTS}); provide --space-rid and retry."
+                    )
+        return candidates
+
+    @staticmethod
+    def _parse_search_token(page_token: Optional[str]) -> str:
+        if page_token is None:
+            return ""
+        prefix = "project-search-after:"
+        if not page_token.startswith(prefix):
+            raise ValueError("invalid project search page_token")
+        after_rid = page_token[len(prefix) :]
+        if not after_rid:
+            raise ValueError("invalid project search page_token")
+        return after_rid
+
+    @staticmethod
+    def _read_sdk_page(iterator: Any) -> tuple[List[Any], Optional[str]]:
+        """Read the first SDK ResourceIterator page without advancing again."""
+        page_data = getattr(iterator, "data", None)
+        if page_data is not None and not isinstance(page_data, (list, tuple)):
+            raise TypeError("SDK page data must be a list")
+        if isinstance(page_data, (list, tuple)):
+            raw_items = list(page_data)
+        else:
+            if isinstance(iterator, (str, bytes, dict)):
+                raise TypeError("SDK page response must be an iterator")
+            raw_items = list(iterator)
+        next_token = getattr(iterator, "next_page_token", None)
+        if not isinstance(next_token, str) or not next_token:
+            next_token = None
+        return raw_items, next_token
+
+    def _format_project_import(self, item: Any) -> Dict[str, Any]:
+        reference = getattr(item, "reference", item)
+        return {
+            "resource_rid": getattr(reference, "resource_rid", None),
+            "name": getattr(reference, "name", None),
+            "imported_at": self._format_timestamp(
+                getattr(reference, "imported_at", None)
+            ),
+            "imported_by": getattr(reference, "imported_by", None),
+            "type": getattr(reference, "type", None),
+        }
+
+    @staticmethod
+    def _format_error_detail(error: Exception) -> str:
+        message = str(error).strip()
+        if message:
+            return message
+        return error.__class__.__name__
 
     # ==================== Organization Operations ====================
 

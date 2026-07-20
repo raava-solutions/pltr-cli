@@ -9,6 +9,7 @@ from rich.table import Table
 
 from ..services.resource import ResourceService
 from ..utils.formatting import OutputFormatter
+from ..utils.agent_output import require_confirmation
 from ..utils.progress import SpinnerProgressTracker
 from ..auth.base import ProfileNotFoundError, MissingCredentialsError
 from ..utils.completion import (
@@ -424,13 +425,12 @@ def delete_resource(
 ):
     """Move a resource to trash."""
     try:
-        if not force:
-            confirm = typer.confirm(
-                f"Are you sure you want to move resource {resource_rid} to trash?"
-            )
-            if not confirm:
-                formatter.print_info("Operation cancelled.")
-                return
+        if not require_confirmation(
+            f"Are you sure you want to move resource {resource_rid} to trash?",
+            confirmed=force,
+        ):
+            formatter.print_info("Operation cancelled.")
+            return
 
         service = ResourceService(profile=profile)
 
@@ -491,14 +491,13 @@ def permanently_delete_resource(
 ):
     """Permanently delete a resource from trash. This action is irreversible."""
     try:
-        if not force:
-            confirm = typer.confirm(
-                f"Are you sure you want to PERMANENTLY delete resource {resource_rid}? "
-                "This action cannot be undone!"
-            )
-            if not confirm:
-                formatter.print_info("Operation cancelled.")
-                return
+        if not require_confirmation(
+            f"Are you sure you want to PERMANENTLY delete resource {resource_rid}? "
+            "This action cannot be undone!",
+            confirmed=force,
+        ):
+            formatter.print_info("Operation cancelled.")
+            return
 
         service = ResourceService(profile=profile)
 

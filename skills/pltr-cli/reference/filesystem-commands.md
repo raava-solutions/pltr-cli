@@ -123,9 +123,28 @@ pltr project create "ML Pipeline" ri.compass.main.space.abc123 \
 ```bash
 pltr project get PROJECT_RID
 pltr project list [--space-rid RID]
+pltr project imports PROJECT_RID [--reference-type EXTERNAL|FILESYSTEM] [--page-size N] [--page-token TOKEN]
+pltr project search QUERY [--space-rid SPACE_RID] [--page-size N] [--page-token TOKEN]
+pltr project templates
 pltr project update PROJECT_RID [--display-name TEXT] [--description TEXT]
 pltr project delete PROJECT_RID [--confirm]
 ```
+
+`project imports` uses the SDK's verified `Project.Reference.list` contract.
+Project search is a bounded client-side filter over visible project metadata;
+its continuation token is a RID keyset cursor, not a Foundry server token. The
+pinned SDK exposes project creation from a known template RID but does not
+expose a
+public template catalog, so `project templates` fails explicitly.
+
+## Namespace Discovery
+
+```bash
+pltr namespace list [--page-size N] [--page-token TOKEN] [--format agent]
+```
+
+SDK 1.95.0 has no separate Namespace resource. This command lists native
+Compass Spaces as namespace discovery records and includes `source_type: space`.
 
 ### Add Organizations to Project
 
@@ -171,6 +190,20 @@ pltr project create-from-template -t ri.template.main.123 \
   -v "environment=production" \
   -d "Project from template"
 ```
+
+## Resource Graph
+
+```bash
+pltr lineage graph RESOURCE_RID \
+  [--direction upstream|downstream|both] \
+  [--max-depth N] [--max-nodes N] [--max-edges N] \
+  [--page-size N] [--page-token TOKEN] [--format agent]
+```
+
+The graph is built from verified filesystem parent/child and project-reference
+APIs. It is bounded and always reports incomplete coverage because the public
+SDK has no transformation-lineage endpoint; it must not be treated as full
+pipeline lineage.
 
 ## Resource Commands
 

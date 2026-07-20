@@ -13,6 +13,22 @@ pltr dataset get ri.foundry.main.dataset.abc123
 pltr dataset get ri.foundry.main.dataset.abc123 --format json --output info.json
 ```
 
+## Dataset Statistics
+
+```bash
+pltr dataset stats DATASET_RID [--branch BRANCH] \
+  [--page-size N] [--page-token TOKEN] [--max-pages N] [--fetch-all] \
+  [--format agent]
+```
+
+Statistics are derived from the verified dataset file and transaction APIs.
+The response includes file count, hidden-file count, byte totals, transaction
+identifiers, warnings, and pagination coverage. File statistics are scoped to
+`--branch`; the SDK transaction endpoint has no branch filter, so transaction
+statistics are explicitly marked dataset-wide and the overall result is
+partial. Without `--fetch-all`, a continuation token also means file totals
+are incomplete.
+
 ## Create Dataset
 
 ```bash

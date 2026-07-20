@@ -38,6 +38,43 @@ def sample_dataset():
 
 
 # Tests for 'get' command
+def test_dataset_stats_success_and_pagination(mock_dataset_service):
+    mock_dataset_service.get_dataset_stats.return_value = {
+        "dataset_rid": "ri.foundry.main.dataset.test",
+        "file_count": 2,
+        "size_bytes": 10,
+        "warnings": [],
+        "pagination": {"has_more": True, "next_page_token": "next"},
+    }
+
+    result = runner.invoke(
+        app,
+        [
+            "stats",
+            "ri.foundry.main.dataset.test",
+            "--page-size",
+            "5",
+            "--page-token",
+            "previous",
+            "--fetch-all",
+            "--format",
+            "agent",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_dataset_service.get_dataset_stats.assert_called_once_with(
+        "ri.foundry.main.dataset.test",
+        branch="master",
+        page_size=5,
+        page_token="previous",
+        max_pages=1,
+        fetch_all=True,
+    )
+    assert '"schema_version": "pltr-agent-v1"' in result.stdout
+    assert '"next_page_token": "next"' in result.stdout
+
+
 def test_get_dataset_success(mock_dataset_service, sample_dataset):
     """Test successful dataset retrieval."""
     mock_dataset_service.get_dataset.return_value = sample_dataset

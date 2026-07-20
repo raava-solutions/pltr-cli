@@ -13,6 +13,13 @@ from rich.console import Console
 from rich.table import Table
 from rich import print as rich_print
 
+from .agent_output import (
+    agent_mode_enabled,
+    render_agent_json,
+    render_agent_message,
+    resolve_output_format,
+)
+
 # Type checking import to avoid circular dependencies
 from typing import TYPE_CHECKING
 
@@ -53,6 +60,9 @@ class OutputFormatter:
         Returns:
             Formatted string if no output file specified
         """
+        format_type = resolve_output_format(format_type)
+        if format_type == "agent":
+            return self._format_agent(data, output_file)
         if format_type == "json":
             return self._format_json(data, output_file)
         elif format_type == "csv":
@@ -72,7 +82,10 @@ class OutputFormatter:
         output_mode: str = "graph",
     ) -> str:
         """Render one already-complete dependency analysis without rediscovery."""
-        if format_type == "json":
+        format_type = resolve_output_format(format_type)
+        if format_type == "agent":
+            rendered = render_agent_json(result, meta={"result_type": "dependency"})
+        elif format_type == "json":
             rendered = (
                 json.dumps(
                     self._make_json_serializable(result), indent=2, sort_keys=True
@@ -412,6 +425,18 @@ class OutputFormatter:
         )
         return "\n".join(lines) + "\n"
 
+    def _format_agent(
+        self, data: Any, output_file: Optional[str] = None
+    ) -> Optional[str]:
+        """Format data using the stable agent envelope."""
+        rendered = render_agent_json(data, meta={"result_type": type(data).__name__})
+        if output_file:
+            with open(output_file, "w", encoding="utf-8") as handle:
+                handle.write(rendered)
+            return None
+        print(rendered, end="")
+        return rendered
+
     def _format_json(
         self, data: Any, output_file: Optional[str] = None
     ) -> Optional[str]:
@@ -682,18 +707,30 @@ class OutputFormatter:
 
     def print_success(self, message: str):
         """Print success message with formatting."""
+        if agent_mode_enabled():
+            print(render_agent_message(message, level="success"), end="")
+            return
         self.console.print(f"✅ {message}", style="green")
 
     def print_error(self, message: str):
         """Print error message with formatting."""
+        if agent_mode_enabled():
+            print(render_agent_message(message, level="error"), end="")
+            return
         self.console.print(f"❌ {message}", style="red")
 
     def print_warning(self, message: str):
         """Print warning message with formatting."""
+        if agent_mode_enabled():
+            print(render_agent_message(message, level="warning"), end="")
+            return
         self.console.print(f"⚠️  {message}", style="yellow")
 
     def print_info(self, message: str):
         """Print info message with formatting."""
+        if agent_mode_enabled():
+            print(render_agent_message(message), end="")
+            return
         self.console.print(f"ℹ️  {message}", style="blue")
 
     def format_table(
@@ -765,6 +802,7 @@ class OutputFormatter:
         Returns:
             Formatted string if no output file specified
         """
+        format = resolve_output_format(format)
         if format == "table":
             # Convert to key-value pairs for table display
             table_data = [{"Property": k, "Value": str(v)} for k, v in data.items()]
@@ -780,6 +818,7 @@ class OutputFormatter:
             data: Data to display
             format_type: Display format ('table', 'json', 'csv')
         """
+        format_type = resolve_output_format(format_type)
         if isinstance(data, list):
             if data and isinstance(data[0], dict):
                 self.format_output(data, format_type)
@@ -789,7 +828,9 @@ class OutputFormatter:
             self.format_dict(data, format_type)
         else:
             # For simple values, just print them
-            if format_type == "json":
+            if format_type == "agent":
+                print(render_agent_json(data, meta={"result_type": "scalar"}), end="")
+            elif format_type == "json":
                 # Use plain print to ensure valid JSON output without ANSI codes
                 print(json.dumps(data, indent=2, default=str))
             else:
@@ -804,6 +845,7 @@ class OutputFormatter:
             file_path: Path object or string for output file
             format_type: File format ('table', 'json', 'csv')
         """
+        format_type = resolve_output_format(format_type)
         file_path_str = str(file_path)
 
         if isinstance(data, list):
@@ -847,12 +889,14 @@ class OutputFormatter:
             >>> result = PaginationResult(data=[...], metadata=metadata)
             >>> formatter.format_paginated_output(result, "json")
         """
+        format_type = resolve_output_format(format_type)
+
         # Extract data and metadata
         data = result.data if hasattr(result, "data") else result
         metadata = result.metadata if hasattr(result, "metadata") else None
 
-        # JSON format: include pagination metadata in output
-        if format_type == "json":
+        # Agent/JSON formats include pagination metadata in output
+        if format_type in {"agent", "json"}:
             if metadata:
                 output_data = {
                     "data": data,
@@ -869,9 +913,31 @@ class OutputFormatter:
                         metadata.next_page_token
                     )
 
+                if format_type == "agent":
+                    rendered = render_agent_json(
+                        data,
+                        meta={"result_type": "paginated"},
+                        pagination=output_data["pagination"],
+                    )
+                    if output_file:
+                        with open(output_file, "w", encoding="utf-8") as handle:
+                            handle.write(rendered)
+                        return None
+                    print(rendered, end="")
+                    return rendered
                 return self._format_json(output_data, output_file)
             else:
                 # No metadata, format data directly
+                if format_type == "agent":
+                    rendered = render_agent_json(
+                        data, meta={"result_type": "paginated"}
+                    )
+                    if output_file:
+                        with open(output_file, "w", encoding="utf-8") as handle:
+                            handle.write(rendered)
+                        return None
+                    print(rendered, end="")
+                    return rendered
                 return self._format_json(data, output_file)
 
         # Table/CSV format: format data normally, then print pagination info

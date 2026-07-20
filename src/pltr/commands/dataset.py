@@ -7,6 +7,7 @@ from typing import Optional
 from rich.console import Console
 
 from ..services.dataset import DatasetService
+from ..utils.agent_output import agent_mode_enabled, render_agent_json
 from ..utils.formatting import OutputFormatter
 from ..utils.pagination import PaginationConfig
 from ..utils.progress import SpinnerProgressTracker
@@ -72,6 +73,75 @@ def get_dataset(
     except Exception as e:
         formatter.print_error(f"Failed to get dataset: {e}")
         raise typer.Exit(1)
+
+
+@app.command("stats")
+def get_dataset_stats(
+    dataset_rid: str = typer.Argument(
+        ..., help="Dataset Resource Identifier", autocompletion=complete_rid
+    ),
+    branch: str = typer.Option("master", "--branch", help="Dataset branch"),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", "-p", help="Profile name", autocompletion=complete_profile
+    ),
+    format: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format (table, json, csv, agent)",
+        autocompletion=complete_output_format,
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Output file path"
+    ),
+    page_size: Optional[int] = typer.Option(
+        None, "--page-size", help="File and transaction page size", min=1
+    ),
+    page_token: Optional[str] = typer.Option(
+        None, "--page-token", help="Resume file statistics from this token"
+    ),
+    max_pages: Optional[int] = typer.Option(
+        1, "--max-pages", help="Maximum file pages to inspect", min=1
+    ),
+    fetch_all: bool = typer.Option(
+        False, "--fetch-all", help="Fetch all available file pages"
+    ),
+):
+    """Compute bounded file and transaction statistics for a dataset."""
+    try:
+        stats = DatasetService(profile=profile).get_dataset_stats(
+            dataset_rid,
+            branch=branch,
+            page_size=page_size,
+            page_token=page_token,
+            max_pages=max_pages,
+            fetch_all=fetch_all,
+        )
+        if agent_mode_enabled() or format == "agent":
+            payload = dict(stats)
+            pagination = payload.pop("pagination", None)
+            warnings = payload.pop("warnings", [])
+            rendered = render_agent_json(
+                payload,
+                meta={"operation": "get_dataset_stats"},
+                warnings=warnings,
+                pagination=pagination,
+            )
+            if output:
+                with open(output, "w", encoding="utf-8") as handle:
+                    handle.write(rendered)
+            else:
+                print(rendered, end="")
+        elif format == "json":
+            formatter.format_dict(stats, format, output)
+        else:
+            formatter.format_dict(stats, format, output)
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1) from e
+    except Exception as e:
+        formatter.print_error(f"Failed to get dataset statistics: {e}")
+        raise typer.Exit(1) from e
 
 
 @app.command("preview")

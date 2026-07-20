@@ -28,6 +28,7 @@ A comprehensive command-line interface for Palantir Foundry APIs, providing 81+ 
 - ⚡ **Shell Completion**: Auto-completion for bash, zsh, and fish
 - 🎨 **Rich Output**: Beautiful terminal formatting with multiple export formats (table, JSON, CSV)
 - 👤 **Multi-Profile Support**: Manage multiple Foundry environments seamlessly
+- 🤖 **Agent-Native Interface**: Stable JSON envelopes, explicit limits, and non-interactive execution for autonomous agents
 
 ## Installation
 
@@ -75,6 +76,16 @@ pltr verify
 ```
 
 ### 3. Start Exploring
+
+For autonomous agents, use the stable machine-readable contract:
+
+```bash
+pltr --agent capabilities
+pltr --agent resource list --folder-rid ri.compass.main.folder.0
+pltr --agent dataset files list ri.foundry.main.dataset.abc123 --page-size 50
+```
+
+`--agent` returns structured `data`, `meta`, `warnings`, `errors`, `pagination`, and `artifacts` fields. Use `--non-interactive` with an explicit mutation confirmation flag for automation.
 
 ```bash
 # Check current user

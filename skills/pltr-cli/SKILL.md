@@ -27,7 +27,7 @@ pltr-cli is a comprehensive CLI with 100+ commands for:
 - **SQL queries**: Execute queries, export results, manage async queries
 - **Ontology**: List ontologies, object types, objects, execute actions and queries
 - **Orchestration**: Manage builds, jobs, and schedules
-- **Filesystem**: Folders, spaces, projects, resources
+- **Filesystem**: Folders, spaces/namespaces, projects, imports, resources, bounded graphs
 - **Admin**: User, group, role management
 - **Connectivity**: External connections and data imports
 - **MediaSets**: Media file management
@@ -37,6 +37,7 @@ pltr-cli is a comprehensive CLI with 100+ commands for:
 - **AIP Agents**: Manage AI agents, sessions, and versions
 - **Models**: ML model registry for model and version management
 - **Dependency analysis**: Evidence-backed dependency paths, coverage gaps, provenance, and complete local graph artifacts
+- **Agent contract**: Stable `pltr-agent-v1` envelopes with resumable pagination for native discovery and dataset statistics
 
 ## Critical Concepts
 
@@ -92,7 +93,7 @@ Load these files based on the user's task:
 | Builds, jobs, schedules | `reference/orchestration-commands.md` |
 | Ontologies, objects, actions | `reference/ontology-commands.md` |
 | Users, groups, roles, orgs | `reference/admin-commands.md` |
-| Folders, spaces, projects, resources, permissions | `reference/filesystem-commands.md` |
+| Folders, spaces/namespaces, projects, imports, resources, permissions, graphs | `reference/filesystem-commands.md` |
 | Connections, imports | `reference/connectivity-commands.md` |
 | Media sets, media items | `reference/mediasets-commands.md` |
 | Anthropic Claude models, OpenAI embeddings | `reference/language-models-commands.md` |

@@ -2,6 +2,8 @@
 
 pltr-cli supports multiple authentication methods for connecting to Palantir Foundry instances. This guide covers setup, configuration, and best practices.
 
+The native CLI is the supported interface for autonomous agents. Agents reuse the same configured profile and keyring credentials as human commands; credentials are never passed through an external MCP runtime.
+
 ## 🔐 Authentication Methods
 
 pltr-cli supports two authentication methods:

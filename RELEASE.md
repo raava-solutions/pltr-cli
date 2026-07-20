@@ -8,6 +8,25 @@ The release script (`scripts/release.py`) supports both interactive and non-inte
 - **Interactive mode**: For human developers who want to review and confirm each step
 - **Non-interactive mode**: For AI agents and automated systems that need to create releases programmatically
 
+## Native agent interface
+
+The CLI's native `--agent` output is the supported interface for autonomous agents. Releases must verify the capability manifest and agent-output contract without requiring Node, npm, or an external MCP package.
+
+Removal of `pltr mcp` is a breaking change and must be called out in release notes with native command replacements.
+
+## Current unreleased notes
+
+This release advances the native agent-first Foundry interface with:
+
+- Compass discovery for namespace-like Spaces, project imports, and bounded project search.
+- Dataset statistics with explicit pagination and coverage metadata.
+- Bounded RID-stable resource graphs for filesystem hierarchy and project-reference relationships.
+- Stable agent envelopes, redaction, explicit errors, and safety gates across the new workflows.
+
+Migration note: replace `pltr mcp` with native commands such as `pltr capabilities --format agent`, `pltr project search --format agent`, `pltr dataset stats --format agent`, and `pltr lineage graph --format agent`.
+
+Known limitations: project-template listing is explicitly unsupported because no public SDK catalog operation is available; namespace discovery is Space-based rather than a separate Namespace API; and resource graphs are not full transformation lineage and report incomplete coverage where applicable.
+
 ## Quick Start
 
 ### For Humans (Interactive Mode)

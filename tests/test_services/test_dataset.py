@@ -3,6 +3,7 @@ Tests for dataset service.
 """
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from pltr.services.dataset import DatasetService
@@ -44,6 +45,66 @@ def sample_dataset_full():
     dataset.parent_folder_rid = "ri.foundry.main.folder.parent"
     # The v2 API only has these three attributes
     return dataset
+
+
+def test_get_dataset_stats_derives_file_and_transaction_fields(mock_dataset_service):
+    service, mock_dataset_class = mock_dataset_service
+    first_file = SimpleNamespace(path="data/part-1", size_bytes=100)
+    hidden_file = SimpleNamespace(path=".metadata", size_bytes=25)
+    mock_dataset_class.File.list.return_value = SimpleNamespace(
+        data=[first_file, hidden_file], next_page_token="more-files"
+    )
+    mock_dataset_class.transactions.return_value = SimpleNamespace(
+        data=[SimpleNamespace(rid="ri.foundry.tx.1")], next_page_token=None
+    )
+
+    result = service.get_dataset_stats(
+        "ri.foundry.main.dataset.test", page_size=2, max_pages=1
+    )
+
+    mock_dataset_class.File.list.assert_called_once_with(
+        dataset_rid="ri.foundry.main.dataset.test",
+        branch_name="master",
+        page_size=2,
+    )
+    assert result["file_count"] == 2
+    assert result["hidden_file_count"] == 1
+    assert result["total_size_bytes"] == 125
+    assert result["transaction_count"] == 1
+    assert result["coverage"] == "partial"
+    assert result["pagination"]["files"]["next_page_token"] == "more-files"
+
+
+def test_get_dataset_stats_fetch_all_continues_with_sdk_token(mock_dataset_service):
+    service, mock_dataset_class = mock_dataset_service
+    mock_dataset_class.File.list.side_effect = [
+        SimpleNamespace(
+            data=[SimpleNamespace(path="a", size_bytes=1)], next_page_token="next"
+        ),
+        SimpleNamespace(
+            data=[SimpleNamespace(path="b", size_bytes=2)], next_page_token=None
+        ),
+    ]
+    mock_dataset_class.transactions.return_value = SimpleNamespace(
+        data=[], next_page_token=None
+    )
+
+    result = service.get_dataset_stats(
+        "ri.foundry.main.dataset.test", page_size=1, fetch_all=True
+    )
+
+    assert result["file_count"] == 2
+    assert result["total_size_bytes"] == 3
+    assert mock_dataset_class.File.list.call_count == 2
+    assert mock_dataset_class.File.list.call_args_list[1].kwargs["page_token"] == "next"
+
+
+def test_get_dataset_stats_propagates_dataset_api_error(mock_dataset_service):
+    service, mock_dataset_class = mock_dataset_service
+    mock_dataset_class.File.list.side_effect = PermissionError("denied")
+
+    with pytest.raises(RuntimeError, match="denied"):
+        service.get_dataset_stats("ri.foundry.main.dataset.test")
 
 
 def test_dataset_service_initialization():

@@ -571,3 +571,72 @@ class TestProjectService:
         assert result["organization_rid"] == "ri.compass.main.org.123"
         assert result["display_name"] == "My Organization"
         assert result["description"] == "Organization description"
+
+    def test_get_project_imports_reads_reference_page(
+        self, project_service, mock_client
+    ):
+        reference = Mock()
+        reference.resource_rid = "ri.foundry.main.dataset.imported"
+        reference.name = "Imported dataset"
+        reference.type = "filesystem"
+        item = Mock()
+        item.reference = reference
+        iterator = Mock()
+        iterator.data = [item]
+        iterator.next_page_token = "next-imports"
+        mock_client.filesystem.Project.Reference.list.return_value = iterator
+        project_service._client = mock_client
+
+        result = project_service.get_project_imports(
+            "ri.compass.main.project.1",
+            reference_type="filesystem",
+            page_size=10,
+            page_token="previous",
+        )
+
+        mock_client.filesystem.Project.Reference.list.assert_called_once_with(
+            "ri.compass.main.project.1",
+            page_size=10,
+            page_token="previous",
+            reference_type="FILESYSTEM",
+        )
+        assert result.data[0]["resource_rid"] == "ri.foundry.main.dataset.imported"
+        assert result.metadata.next_page_token == "next-imports"
+
+    def test_get_project_imports_rejects_unknown_reference_type(self, project_service):
+        with pytest.raises(ValueError, match="reference_type"):
+            project_service.get_project_imports(
+                "ri.compass.main.project.1", reference_type="unknown"
+            )
+
+    def test_search_projects_filters_and_resumes(self, project_service, mock_client):
+        space = Mock()
+        space.rid = "ri.compass.main.space.1"
+        first = Mock()
+        first.rid = "ri.compass.main.project.b"
+        first.type = "PROJECT"
+        first.display_name = "Beta"
+        first.description = "matches"
+        second = Mock()
+        second.rid = "ri.compass.main.project.a"
+        second.type = "PROJECT"
+        second.display_name = "Alpha"
+        second.description = "matches"
+        mock_client.filesystem.Space.list.return_value = [space]
+        mock_client.filesystem.Folder.children.return_value = [first, second]
+        project_service._client = mock_client
+
+        result = project_service.search_projects("matches", page_size=1)
+        resumed = project_service.search_projects(
+            "matches", page_size=1, page_token=result.metadata.next_page_token
+        )
+
+        assert result.data[0]["rid"] == "ri.compass.main.project.a"
+        assert result.metadata.next_page_token == (
+            "project-search-after:ri.compass.main.project.a"
+        )
+        assert resumed.data[0]["rid"] == "ri.compass.main.project.b"
+
+    def test_search_projects_rejects_malformed_token(self, project_service):
+        with pytest.raises(ValueError, match="invalid project search page_token"):
+            project_service.search_projects("x", page_token="not-a-token")

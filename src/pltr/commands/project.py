@@ -7,7 +7,9 @@ from typing import Optional, List
 from rich.console import Console
 from rich.table import Table
 
+from ..services.compass import CompassService, UnsupportedCapabilityError
 from ..services.project import ProjectService
+from ..utils.agent_output import agent_mode_enabled, render_agent_json
 from ..utils.formatting import OutputFormatter
 from ..utils.progress import SpinnerProgressTracker
 from ..auth.base import ProfileNotFoundError, MissingCredentialsError
@@ -21,6 +23,31 @@ from ..utils.completion import (
 app = typer.Typer()
 console = Console()
 formatter = OutputFormatter(console)
+
+
+def _emit_project_page(
+    data: List[dict[str, object]],
+    pagination: dict[str, object],
+    operation: str,
+    format: str,
+    output: Optional[str],
+) -> None:
+    """Render a new paginated project operation in all supported modes."""
+    if agent_mode_enabled() or format == "agent":
+        rendered = render_agent_json(
+            data, meta={"operation": operation}, pagination=pagination
+        )
+        if output:
+            with open(output, "w", encoding="utf-8") as handle:
+                handle.write(rendered)
+        else:
+            print(rendered, end="")
+        return
+
+    if format == "json":
+        formatter.format_dict({"data": data, "pagination": pagination}, format, output)
+    else:
+        formatter.format_list(data, format, output)
 
 
 @app.command("create")
@@ -228,6 +255,123 @@ def list_projects(
     except Exception as e:
         formatter.print_error(f"Failed to list projects: {e}")
         raise typer.Exit(1)
+
+
+@app.command("imports")
+def get_project_imports(
+    project_rid: str = typer.Argument(..., help="Project Resource Identifier"),
+    reference_type: Optional[str] = typer.Option(
+        None,
+        "--reference-type",
+        help="Filter by EXTERNAL or FILESYSTEM reference",
+    ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", help="Profile name", autocompletion=complete_profile
+    ),
+    format: str = typer.Option(
+        "table", "--format", "-f", help="Output format (table, json, csv, agent)"
+    ),
+    output: Optional[str] = typer.Option(None, "--output", "-o"),
+    page_size: Optional[int] = typer.Option(None, "--page-size", min=1),
+    page_token: Optional[str] = typer.Option(None, "--page-token"),
+):
+    """List resources imported or referenced by a project."""
+    try:
+        result = ProjectService(profile=profile).get_project_imports(
+            project_rid,
+            reference_type=reference_type,
+            page_size=page_size,
+            page_token=page_token,
+        )
+        _emit_project_page(
+            result.data,
+            result.metadata.to_dict(),
+            "get_project_imports",
+            format,
+            output,
+        )
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1) from e
+    except Exception as e:
+        formatter.print_error(f"Failed to list project imports: {e}")
+        raise typer.Exit(1) from e
+
+
+@app.command("search")
+def search_foundry_projects(
+    query: str = typer.Argument(..., help="Text to match in project metadata"),
+    space_rid: Optional[str] = typer.Option(
+        None, "--space-rid", help="Restrict search to one Space"
+    ),
+    profile: Optional[str] = typer.Option(
+        None, "--profile", help="Profile name", autocompletion=complete_profile
+    ),
+    format: str = typer.Option(
+        "table", "--format", "-f", help="Output format (table, json, csv, agent)"
+    ),
+    output: Optional[str] = typer.Option(None, "--output", "-o"),
+    page_size: Optional[int] = typer.Option(None, "--page-size", min=1),
+    page_token: Optional[str] = typer.Option(None, "--page-token"),
+):
+    """Search visible project metadata using native filesystem APIs."""
+    try:
+        result = ProjectService(profile=profile).search_projects(
+            query,
+            space_rid=space_rid,
+            page_size=page_size,
+            page_token=page_token,
+        )
+        _emit_project_page(
+            result.data,
+            result.metadata.to_dict(),
+            "search_foundry_projects",
+            format,
+            output,
+        )
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1) from e
+    except Exception as e:
+        formatter.print_error(f"Failed to search projects: {e}")
+        raise typer.Exit(1) from e
+
+
+@app.command("templates")
+def list_foundry_project_templates(
+    profile: Optional[str] = typer.Option(
+        None, "--profile", help="Profile name", autocompletion=complete_profile
+    ),
+    format: str = typer.Option(
+        "table", "--format", "-f", help="Output format (table, json, csv, agent)"
+    ),
+    output: Optional[str] = typer.Option(None, "--output", "-o"),
+    page_size: Optional[int] = typer.Option(None, "--page-size", min=1),
+    page_token: Optional[str] = typer.Option(None, "--page-token"),
+):
+    """List project templates when a public template catalog is available."""
+    try:
+        CompassService(profile=profile).list_project_templates()
+    except UnsupportedCapabilityError as e:
+        message = str(e)
+        if agent_mode_enabled() or format == "agent":
+            print(
+                render_agent_json(
+                    None,
+                    meta={"operation": "list_foundry_project_templates"},
+                    errors=[{"type": "unsupported", "message": message}],
+                ),
+                end="",
+            )
+        else:
+            formatter.print_error(message)
+        raise typer.Exit(2) from e
+    except (ProfileNotFoundError, MissingCredentialsError) as e:
+        formatter.print_error(f"Authentication error: {e}")
+        raise typer.Exit(1) from e
+    except Exception as e:
+        formatter.print_error(f"Failed to list project templates: {e}")
+        raise typer.Exit(1) from e
 
 
 @app.command("update")

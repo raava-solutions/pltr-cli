@@ -6,12 +6,15 @@ import typer
 from typing_extensions import Annotated
 
 from pltr import __version__
+from pltr.utils.agent_output import configure_agent_settings
 from pltr.commands import (
     configure,
     verify,
     dataset,
     folder,
     project,
+    namespace,
+    lineage,
     resource,
     resource_role,
     space,
@@ -35,7 +38,7 @@ from pltr.commands import (
     widgets,
     proposal,
     dependency,
-    mcp,
+    capabilities,
 )
 from pltr.commands.cp import cp_command
 
@@ -51,6 +54,8 @@ app.add_typer(verify.app, name="verify", help="Verify authentication")
 app.add_typer(dataset.app, name="dataset", help="Manage datasets")
 app.add_typer(folder.app, name="folder", help="Manage folders")
 app.add_typer(project.app, name="project", help="Manage projects")
+app.add_typer(namespace.app, name="namespace", help="Discover Compass namespaces")
+app.add_typer(lineage.app, name="lineage", help="Inspect bounded resource graphs")
 app.add_typer(resource.app, name="resource", help="Manage resources")
 app.add_typer(
     resource_role.app, name="resource-role", help="Manage resource permissions"
@@ -127,7 +132,11 @@ app.add_typer(
     name="dependency",
     help="Analyze Foundry dependency graphs and coverage",
 )
-app.add_typer(mcp.app, name="mcp", help="Manage MCP server integration")
+app.add_typer(
+    capabilities.app,
+    name="capabilities",
+    help="Inspect native agent-first Foundry capabilities",
+)
 app.add_typer(shell.shell_app, name="shell", help="Interactive shell mode")
 app.add_typer(completion.app, name="completion", help="Manage shell completions")
 app.add_typer(alias.app, name="alias", help="Manage command aliases")
@@ -148,6 +157,16 @@ def main(
     version: Annotated[
         bool, typer.Option("--version", callback=version_callback, help="Show version")
     ] = False,
+    agent: bool = typer.Option(
+        False,
+        "--agent",
+        help="Use the stable machine-readable agent output contract",
+    ),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help="Disable prompts and require explicit mutation confirmation flags",
+    ),
 ):
     """
     Command-line interface for Palantir Foundry APIs.
@@ -156,7 +175,7 @@ def main(
     intuitive commands for dataset management, ontology operations,
     SQL queries, and more.
     """
-    pass
+    configure_agent_settings(enabled=agent, non_interactive=non_interactive)
 
 
 @app.command()

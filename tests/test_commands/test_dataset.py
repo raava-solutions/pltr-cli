@@ -378,3 +378,30 @@ def test_preview_dataset_error(mock_dataset_service):
 
     assert result.exit_code == 1
     assert "Failed to preview dataset" in result.stdout
+
+
+def test_schedule_list_passes_public_dictionary_contract_to_formatter(
+    mock_dataset_service,
+):
+    schedules = [
+        {
+            "schedule_rid": "ri.orchestration.main.schedule.one",
+            "name": None,
+            "description": None,
+            "enabled": None,
+            "created_time": None,
+        }
+    ]
+    mock_dataset_service.get_schedules.return_value = schedules
+
+    with patch("pltr.commands.dataset.formatter.format_schedules") as format_schedules:
+        result = runner.invoke(
+            app,
+            ["schedules", "list", "ri.foundry.main.dataset.input"],
+        )
+
+    assert result.exit_code == 0
+    mock_dataset_service.get_schedules.assert_called_once_with(
+        "ri.foundry.main.dataset.input"
+    )
+    format_schedules.assert_called_once_with(schedules, "table", None)

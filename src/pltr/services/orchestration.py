@@ -18,7 +18,9 @@ class OrchestrationService(BaseService):
         return self.client.orchestration
 
     # Build operations
-    def get_build(self, build_rid: str) -> Dict[str, Any]:
+    def get_build(
+        self, build_rid: str, request_timeout: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
         Get information about a specific build.
 
@@ -29,10 +31,15 @@ class OrchestrationService(BaseService):
             Build information dictionary
         """
         try:
-            build = self.service.Build.get(build_rid)
+            if request_timeout is None:
+                build = self.service.Build.get(build_rid)
+            else:
+                build = self.service.Build.get(
+                    build_rid=build_rid, request_timeout=request_timeout
+                )
             return self._format_build_info(build)
         except Exception as e:
-            raise RuntimeError(f"Failed to get build {build_rid}: {e}")
+            raise RuntimeError(f"Failed to get build {build_rid}: {e}") from e
 
     def create_build(
         self,
@@ -103,6 +110,7 @@ class OrchestrationService(BaseService):
         build_rid: str,
         page_size: Optional[int] = None,
         page_token: Optional[str] = None,
+        request_timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Get jobs in a build.
@@ -121,11 +129,13 @@ class OrchestrationService(BaseService):
                 kwargs["page_size"] = page_size
             if page_token is not None:
                 kwargs["page_token"] = page_token
+            if request_timeout is not None:
+                kwargs["request_timeout"] = request_timeout
 
             response = self.service.Build.jobs(**kwargs)
             return self._format_jobs_response(response)
         except Exception as e:
-            raise RuntimeError(f"Failed to get jobs for build {build_rid}: {e}")
+            raise RuntimeError(f"Failed to get jobs for build {build_rid}: {e}") from e
 
     def search_builds(
         self,
@@ -276,7 +286,10 @@ class OrchestrationService(BaseService):
 
     # Schedule operations
     def get_schedule(
-        self, schedule_rid: str, preview: Optional[bool] = None
+        self,
+        schedule_rid: str,
+        preview: Optional[bool] = None,
+        request_timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Get information about a specific schedule.
@@ -292,11 +305,35 @@ class OrchestrationService(BaseService):
             kwargs: Dict[str, Any] = {"schedule_rid": schedule_rid}
             if preview is not None:
                 kwargs["preview"] = preview
+            if request_timeout is not None:
+                kwargs["request_timeout"] = request_timeout
 
             schedule = self.service.Schedule.get(**kwargs)
             return self._format_schedule_info(schedule)
         except Exception as e:
-            raise RuntimeError(f"Failed to get schedule {schedule_rid}: {e}")
+            raise RuntimeError(f"Failed to get schedule {schedule_rid}: {e}") from e
+
+    def get_schedule_affected_resources(
+        self,
+        schedule_rid: str,
+        preview: Optional[bool] = None,
+        request_timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return the declared buildable resources affected by a schedule."""
+        kwargs: Dict[str, Any] = {"schedule_rid": schedule_rid}
+        if preview is not None:
+            kwargs["preview"] = preview
+        if request_timeout is not None:
+            kwargs["request_timeout"] = request_timeout
+        try:
+            response = self.service.Schedule.get_affected_resources(**kwargs)
+            data = self._model_to_dict(response)
+            resources = data.get("datasets", [])
+            return {"affected_resources": list(resources or [])}
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to get affected resources for schedule {schedule_rid}: {e}"
+            ) from e
 
     def create_schedule(
         self,
@@ -440,6 +477,7 @@ class OrchestrationService(BaseService):
         schedule_rid: str,
         page_size: Optional[int] = None,
         page_token: Optional[str] = None,
+        request_timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Get recent execution runs for a schedule.
@@ -458,11 +496,15 @@ class OrchestrationService(BaseService):
                 kwargs["page_size"] = page_size
             if page_token is not None:
                 kwargs["page_token"] = page_token
+            if request_timeout is not None:
+                kwargs["request_timeout"] = request_timeout
 
             response = self.service.Schedule.runs(**kwargs)
             return self._format_schedule_runs_response(response)
         except Exception as e:
-            raise RuntimeError(f"Failed to get runs for schedule {schedule_rid}: {e}")
+            raise RuntimeError(
+                f"Failed to get runs for schedule {schedule_rid}: {e}"
+            ) from e
 
     # Formatting methods
     def _format_build_info(self, build: Any) -> Dict[str, Any]:
@@ -472,12 +514,14 @@ class OrchestrationService(BaseService):
         # Extract available attributes
         for attr in [
             "rid",
+            "schedule_rid",
+            "branch_name",
+            "job_rids",
             "status",
             "created_time",
             "started_time",
             "finished_time",
             "created_by",
-            "branch_name",
             "commit_hash",
         ]:
             if hasattr(build, attr):
@@ -492,15 +536,18 @@ class OrchestrationService(BaseService):
         # Extract available attributes
         for attr in [
             "rid",
+            "build_rid",
+            "job_status",
+            "outputs",
             "status",
             "created_time",
             "started_time",
             "finished_time",
             "job_type",
-            "build_rid",
         ]:
             if hasattr(job, attr):
-                info[attr] = getattr(job, attr)
+                value = getattr(job, attr)
+                info[attr] = self._model_to_dict(value)
 
         return info
 
@@ -524,9 +571,11 @@ class OrchestrationService(BaseService):
 
         # Handle nested objects
         if hasattr(schedule, "trigger"):
-            info["trigger"] = str(schedule.trigger)
+            info["trigger"] = self._model_to_dict(schedule.trigger)
         if hasattr(schedule, "action"):
-            info["action"] = str(schedule.action)
+            info["action"] = self._model_to_dict(schedule.action)
+        if hasattr(schedule, "scope_mode"):
+            info["scope_mode"] = self._model_to_dict(schedule.scope_mode)
 
         return info
 
@@ -593,7 +642,7 @@ class OrchestrationService(BaseService):
             "result",
         ]:
             if hasattr(run, attr):
-                info[attr] = getattr(run, attr)
+                info[attr] = self._model_to_dict(getattr(run, attr))
 
         return info
 
@@ -608,3 +657,17 @@ class OrchestrationService(BaseService):
             result["next_page_token"] = response.next_page_token
 
         return result
+
+    def _model_to_dict(self, value: Any) -> Any:
+        """Serialize declared SDK model fields while preserving discriminators."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return [self._model_to_dict(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._model_to_dict(item) for key, item in value.items()}
+        if hasattr(value, "model_dump"):
+            return value.model_dump(by_alias=False, mode="json")
+        if hasattr(value, "dict"):
+            return value.dict(by_alias=False)
+        return value

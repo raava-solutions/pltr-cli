@@ -37,13 +37,15 @@ class TestTokenAuthProvider:
 
     def test_init_missing_token(self):
         """Test initialization fails when token is missing."""
-        with pytest.raises(MissingCredentialsError, match="Token is required"):
-            TokenAuthProvider(host="https://test.palantirfoundry.com")
+        with patch.dict(os.environ, {"FOUNDRY_TOKEN": ""}):
+            with pytest.raises(MissingCredentialsError, match="Token is required"):
+                TokenAuthProvider(host="https://test.palantirfoundry.com")
 
     def test_init_missing_host(self):
         """Test initialization fails when host is missing."""
-        with pytest.raises(MissingCredentialsError, match="Host URL is required"):
-            TokenAuthProvider(token="test_token")
+        with patch.dict(os.environ, {"FOUNDRY_HOST": ""}):
+            with pytest.raises(MissingCredentialsError, match="Host URL is required"):
+                TokenAuthProvider(token="test_token")
 
     def test_init_parameters_override_env(self):
         """Test that explicit parameters override environment variables."""

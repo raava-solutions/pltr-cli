@@ -283,7 +283,7 @@ class TestCLIIntegration:
             profile_manager.add_profile("prod")
 
             # Test listing profiles
-            result = runner.invoke(app, ["configure", "list-profiles"])
+            result = runner.invoke(app, ["configure", "list"])
             assert result.exit_code == 0
             assert "dev" in result.output
             assert "prod" in result.output

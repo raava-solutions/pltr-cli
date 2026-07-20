@@ -25,6 +25,108 @@ pltr <command> --format csv      # CSV format
 pltr <command> --output file.csv # Save to file
 ```
 
+## Dependency Analysis Commands
+
+`pltr dependency` performs read-only, bounded analysis and supports exactly six
+direct target forms:
+
+```bash
+pltr dependency object-type ONTOLOGY_RID OBJECT_TYPE
+pltr dependency property ONTOLOGY_RID OBJECT_TYPE PROPERTY
+pltr dependency link-type ONTOLOGY_RID OBJECT_TYPE LINK_TYPE
+pltr dependency action-type ONTOLOGY_RID ACTION_TYPE
+pltr dependency query-type ONTOLOGY_RID QUERY_TYPE
+pltr dependency resource RESOURCE_RID
+```
+
+`resource` requires a Compass-resolvable RID and specializes datasets and
+third-party applications after resolution. Schedules and standalone Functions
+are traversed only when discovered; they are not direct target commands.
+Workshop names and variables are not accepted as targets.
+
+Every command accepts `--branch`, `--profile`, `--change`, `--change-type`,
+`--compare-artifact`, `--output-mode`, `--direction`, `--depth`, `--max-nodes`,
+`--max-requests`, `--max-pages`, `--max-items`, `--time-budget-seconds`,
+`--format table|json|csv`, `--output`, `--graph-output`, and `--full`.
+`--change-type` is one of `rename`, `type-change`, `optional-to-required`,
+`required-to-optional`, `remove-delete`, `action-input-change`, or
+`query-output-change`. It is additive to free-text `--change`; an explicit type
+wins, while free text without an explicit type is marked as inferred in the result.
+
+`--output-mode graph|agent|ci` defaults to `graph`. Graph mode preserves the
+complete graph rendering and adds verification and blast-radius counts. Agent
+mode gives a compact assessment for table output; JSON and CSV remain complete
+machine-readable projections, with CSV including an `agent` row. CI mode emits
+one JSON summary line and exits `0` for `clean`, `2` for
+`needs-verification`, or `1` for fatal authentication, discovery, rendering, or
+artifact failures.
+
+Defaults are depth 2, 150 nodes, 200 requests, 100 pages, 10,000 items, and 60
+seconds. Hard ceilings are respectively 10, 1,000, 1,000, 500, 100,000, and 600
+seconds. `--full` only expands the graph-mode table; it never changes discovery
+or artifact completeness.
+
+```bash
+# Agent-oriented assessment with an explicit change classification
+pltr dependency object-type ri.ontology.main.ontology.example Employee \
+  --change "rename employeeNumber" \
+  --change-type rename \
+  --output-mode agent \
+  --graph-output ./employee-dependencies.json
+
+# Compare the current graph with a retained artifact and gate in CI
+pltr dependency object-type ri.ontology.main.ontology.example Employee \
+  --compare-artifact ./employee-dependencies.json \
+  --output-mode ci \
+  --graph-output ./employee-dependencies-current.json
+```
+
+Each successful invocation writes the complete graph before rendering. Use
+`--graph-output PATH`, or find it under
+`${XDG_STATE_HOME:-~/.local/state}/pltr/dependency/<analysis-id>.json`.
+Artifacts are written atomically with mode `0600`; their retention and deletion
+are operator-managed. `--output` controls the requested table/JSON/CSV rendering
+and never replaces the graph artifact. Compact output includes the same analysis
+ID, absolute artifact path, SHA-256 digest, top path/evidence, gaps, and budgets.
+The additive agent block is versioned as
+`agent.schema_version = "dependency-agent-v1"`. `--compare-artifact PATH` loads a
+previous JSON graph artifact and reports stable edge-ID additions, removals,
+coverage changes, newly introduced impacts, and whether removals may be due to
+budget truncation. CSV has explicit `artifact`, `agent`, `read-context`, `node`,
+`edge`, `path`, `coverage`, `gap`, `error`, `evidence`, and
+`operation-provenance` row kinds.
+
+Relations retain intrinsic orientation. Dependency-flow relations derive
+root-relative upstream/downstream paths; adjacent-structural relations remain
+adjacent from either root. Coverage is `covered`, `covered-empty`, `partial`,
+`inaccessible`, `unsupported`, `unresolved`, or `budget-exhausted`. A gap never
+means that a dependency is absent.
+
+The target-kind coverage matrix uses `D` for direct supported evidence, `I` for
+a once-per-context reverse index, `C` for conditionally supported evidence,
+`G` for a mandatory explicit gap, and `N` for structurally not applicable.
+`D/G` means supported fields are reported while a known omitted remainder is
+gapped. Conditional dataset records are created per returned schedule, build,
+and job rather than being hidden behind a single parent status.
+
+Operation provenance records the generated SDK namespace/method, pinned
+capability IDs, installed SDK version, timestamps, timeout, and exact branch and
+preview argument states (`explicit`, `server-default`, or `not-applicable`).
+Fatal errors use stable classes including `authentication`, `permission-denied`,
+`not-found`, `branch-not-found`, `rate-limited`, `timeout`, `connection`,
+`invalid-request`, `unsupported`, `unsupported-addressability`,
+`invalid-response`, `budget-exhausted`, `artifact-write-failed`, `internal`,
+and `unknown`.
+
+Dataset schedule RIDs are verified evidence, but the SDK documents that the
+reverse schedule index may lag by up to one hour. Therefore even a successful
+empty schedule lookup is partial, not proof that the dataset has no consumers.
+Schedule actions, triggers, scopes, runs, submitted builds, jobs, and typed
+outputs have separate conditional coverage. Configured target/input evidence
+comes from `Schedule.action.target`, never from a build response. Dynamically
+resolved upstream lineage, output kinds omitted by the API, application internals,
+Workshop internals, and standalone Function reverse wiring remain explicit gaps.
+
 ---
 
 ## 🔧 Configuration Commands

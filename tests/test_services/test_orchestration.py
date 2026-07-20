@@ -2,9 +2,42 @@
 Tests for orchestration service.
 """
 
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import Mock, patch
 
+from foundry_sdk.v2.core.models import Duration
+from foundry_sdk.v2.orchestration.models import (
+    Action,
+    AffectedResourcesResponse,
+    AndTrigger,
+    Build,
+    ConnectingTarget,
+    DatasetUpdatedTrigger,
+    DatasetJobOutput,
+    Job,
+    ManualTarget,
+    ManualTrigger,
+    OrTrigger,
+    ProjectScope,
+    Schedule,
+    ScheduleRun,
+    ScheduleRunError,
+    ScheduleRunIgnored,
+    ScheduleRunSubmitted,
+    ScheduleSucceededTrigger,
+    TransactionalMediaSetJobOutput,
+    UpstreamTarget,
+    UserScope,
+)
+
+from pltr.services.dependency import (
+    AnalysisContext,
+    DependencyGraphService,
+    DependencyTarget,
+)
 from pltr.services.orchestration import OrchestrationService
 from pltr.utils.pagination import PaginationConfig
 
@@ -32,6 +65,51 @@ def mock_orchestration_service():
         # Create service
         service = OrchestrationService()
         return service, mock_build_class, mock_job_class, mock_schedule_class
+
+
+ACTOR_ID = "00000000-0000-0000-0000-000000000001"
+SCHEDULE_RID = "ri.orchestration.main.schedule.test-schedule"
+SCHEDULE_VERSION_RID = "ri.orchestration.main.schedule-version.test-version"
+
+
+def pinned_action(target):
+    return Action(
+        target=target,
+        branchName="feature",
+        fallbackBranches=[],
+        forceBuild=True,
+        abortOnFailure=True,
+        notificationsEnabled=False,
+    )
+
+
+def pinned_schedule(target, *, trigger=None, scope=None):
+    now = datetime.now(timezone.utc)
+    return Schedule(
+        rid=SCHEDULE_RID,
+        displayName="Pinned schedule",
+        description="SDK-shaped schedule",
+        currentVersionRid=SCHEDULE_VERSION_RID,
+        createdTime=now,
+        createdBy=ACTOR_ID,
+        updatedTime=now,
+        updatedBy=ACTOR_ID,
+        paused=False,
+        trigger=trigger or ManualTrigger(),
+        action=pinned_action(target),
+        scopeMode=scope or UserScope(),
+    )
+
+
+def pinned_run(run_suffix, result):
+    return ScheduleRun(
+        rid=f"ri.orchestration.main.schedule-run.{run_suffix}",
+        scheduleRid=SCHEDULE_RID,
+        scheduleVersionRid=SCHEDULE_VERSION_RID,
+        createdTime=datetime.now(timezone.utc),
+        createdBy=ACTOR_ID,
+        result=result,
+    )
 
 
 @pytest.fixture
@@ -650,3 +728,446 @@ def test_format_schedule_info(mock_orchestration_service, sample_schedule):
     assert result["paused"] is False
     assert "trigger" in result
     assert "action" in result
+
+
+def test_pinned_build_schema_and_wrapper_never_expose_target(
+    mock_orchestration_service,
+):
+    service, mock_build_class, _, _ = mock_orchestration_service
+    expected_fields = {
+        "rid",
+        "branch_name",
+        "created_time",
+        "created_by",
+        "fallback_branches",
+        "job_rids",
+        "retry_count",
+        "retry_backoff_duration",
+        "abort_on_failure",
+        "status",
+        "finished_time",
+        "schedule_rid",
+    }
+    assert set(Build.model_fields) == expected_fields
+    assert "target" not in Build.model_fields
+
+    build = Build(
+        rid="ri.orchestration.main.build.test-build",
+        branchName="feature",
+        createdTime=datetime.now(timezone.utc),
+        createdBy="00000000-0000-0000-0000-000000000001",
+        fallbackBranches=[],
+        jobRids=["ri.orchestration.main.job.test-job"],
+        retryCount=0,
+        retryBackoffDuration=Duration(value=1, unit="SECONDS"),
+        abortOnFailure=True,
+        status="SUCCEEDED",
+        scheduleRid="ri.orchestration.main.schedule.test-schedule",
+    )
+    mock_build_class.get.return_value = build
+
+    result = service.get_build(build.rid, request_timeout=19)
+
+    assert result["rid"] == build.rid
+    assert result["job_rids"] == ["ri.orchestration.main.job.test-job"]
+    assert result["schedule_rid"] == "ri.orchestration.main.schedule.test-schedule"
+    assert "target" not in result
+    mock_build_class.get.assert_called_once_with(
+        build_rid=build.rid, request_timeout=19
+    )
+
+
+def test_pinned_job_outputs_are_preserved_as_declared_discriminated_models(
+    mock_orchestration_service,
+):
+    service, mock_build_class, _, _ = mock_orchestration_service
+    dataset_output = DatasetJobOutput(datasetRid="ri.foundry.main.dataset.output")
+    media_output = TransactionalMediaSetJobOutput(
+        mediaSetRid="ri.mio.main.media-set.output"
+    )
+    job = Job(
+        rid="ri.orchestration.main.job.test-job",
+        buildRid="ri.orchestration.main.build.test-build",
+        startedTime=datetime.now(timezone.utc),
+        jobStatus="SUCCEEDED",
+        outputs=[dataset_output, media_output],
+    )
+    page = Mock(data=[job], next_page_token=None)
+    mock_build_class.jobs.return_value = page
+
+    result = service.get_build_jobs(
+        "ri.orchestration.main.build.test-build", request_timeout=13
+    )
+
+    assert result["jobs"][0]["outputs"] == [
+        {
+            "dataset_rid": "ri.foundry.main.dataset.output",
+            "output_transaction_rid": None,
+            "type": "datasetJobOutput",
+        },
+        {
+            "media_set_rid": "ri.mio.main.media-set.output",
+            "transaction_id": None,
+            "type": "transactionalMediaSetJobOutput",
+        },
+    ]
+    mock_build_class.jobs.assert_called_once_with(
+        build_rid="ri.orchestration.main.build.test-build", request_timeout=13
+    )
+
+
+def test_affected_resources_uses_pinned_datasets_field(mock_orchestration_service):
+    service, _, _, mock_schedule_class = mock_orchestration_service
+    response = AffectedResourcesResponse(datasets=["ri.foundry.main.dataset.output"])
+    mock_schedule_class.get_affected_resources.return_value = response
+
+    assert service.get_schedule_affected_resources(
+        "ri.orchestration.main.schedule.test-schedule",
+        preview=True,
+        request_timeout=11,
+    ) == {"affected_resources": ["ri.foundry.main.dataset.output"]}
+    mock_schedule_class.get_affected_resources.assert_called_once_with(
+        schedule_rid="ri.orchestration.main.schedule.test-schedule",
+        preview=True,
+        request_timeout=11,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_target", "scope", "expected_scope"),
+    [
+        (
+            ManualTarget(targetRids=["ri.foundry.main.dataset.manual"]),
+            {
+                "target_rids": ["ri.foundry.main.dataset.manual"],
+                "type": "manual",
+            },
+            UserScope(),
+            {"type": "user"},
+        ),
+        (
+            UpstreamTarget(
+                targetRids=["ri.foundry.main.dataset.upstream"],
+                ignoredRids=["ri.foundry.main.dataset.ignored"],
+            ),
+            {
+                "target_rids": ["ri.foundry.main.dataset.upstream"],
+                "ignored_rids": ["ri.foundry.main.dataset.ignored"],
+                "type": "upstream",
+            },
+            ProjectScope(projectRids=["ri.compass.main.folder.project"]),
+            {
+                "project_rids": ["ri.compass.main.folder.project"],
+                "type": "project",
+            },
+        ),
+        (
+            ConnectingTarget(
+                inputRids=["ri.foundry.main.dataset.input"],
+                targetRids=["ri.foundry.main.dataset.output"],
+                ignoredRids=["ri.foundry.main.dataset.ignored"],
+            ),
+            {
+                "input_rids": ["ri.foundry.main.dataset.input"],
+                "target_rids": ["ri.foundry.main.dataset.output"],
+                "ignored_rids": ["ri.foundry.main.dataset.ignored"],
+                "type": "connecting",
+            },
+            UserScope(),
+            {"type": "user"},
+        ),
+    ],
+)
+def test_pinned_schedule_action_target_and_scope_survive_real_wrapper(
+    mock_orchestration_service,
+    target,
+    expected_target,
+    scope,
+    expected_scope,
+):
+    service, _, _, mock_schedule_class = mock_orchestration_service
+    mock_schedule_class.get.return_value = pinned_schedule(target, scope=scope)
+
+    result = service.get_schedule(SCHEDULE_RID, preview=True, request_timeout=9)
+
+    assert result["action"] == {
+        "target": expected_target,
+        "branch_name": "feature",
+        "fallback_branches": [],
+        "force_build": True,
+        "retry_count": None,
+        "retry_backoff_duration": None,
+        "abort_on_failure": True,
+        "notifications_enabled": False,
+    }
+    assert result["scope_mode"] == expected_scope
+    mock_schedule_class.get.assert_called_once_with(
+        schedule_rid=SCHEDULE_RID,
+        preview=True,
+        request_timeout=9,
+    )
+
+
+def test_pinned_recursive_trigger_survives_real_schedule_wrapper(
+    mock_orchestration_service,
+):
+    service, _, _, mock_schedule_class = mock_orchestration_service
+    trigger = AndTrigger(
+        triggers=[
+            DatasetUpdatedTrigger(
+                datasetRid="ri.foundry.main.dataset.trigger", branchName="master"
+            ),
+            OrTrigger(
+                triggers=[
+                    ScheduleSucceededTrigger(
+                        scheduleRid="ri.orchestration.main.schedule.upstream"
+                    ),
+                    ManualTrigger(),
+                ]
+            ),
+        ]
+    )
+    mock_schedule_class.get.return_value = pinned_schedule(
+        ManualTarget(targetRids=["ri.foundry.main.dataset.output"]),
+        trigger=trigger,
+    )
+
+    result = service.get_schedule(SCHEDULE_RID)
+
+    assert result["trigger"] == {
+        "triggers": [
+            {
+                "dataset_rid": "ri.foundry.main.dataset.trigger",
+                "branch_name": "master",
+                "type": "datasetUpdated",
+            },
+            {
+                "triggers": [
+                    {
+                        "schedule_rid": "ri.orchestration.main.schedule.upstream",
+                        "type": "scheduleSucceeded",
+                    },
+                    {"type": "manual"},
+                ],
+                "type": "or",
+            },
+        ],
+        "type": "and",
+    }
+
+
+@pytest.mark.parametrize(
+    ("result_model", "expected_result"),
+    [
+        (
+            ScheduleRunSubmitted(
+                buildRid="ri.orchestration.main.build.submitted-build"
+            ),
+            {
+                "build_rid": "ri.orchestration.main.build.submitted-build",
+                "type": "submitted",
+            },
+        ),
+        (ScheduleRunIgnored(), {"type": "ignored"}),
+        (
+            ScheduleRunError(errorName="INTERNAL", description="failed safely"),
+            {
+                "error_name": "INTERNAL",
+                "description": "failed safely",
+                "type": "error",
+            },
+        ),
+        (None, None),
+    ],
+)
+def test_pinned_schedule_run_result_variants_survive_real_wrapper(
+    mock_orchestration_service,
+    result_model,
+    expected_result,
+):
+    service, _, _, mock_schedule_class = mock_orchestration_service
+    run = pinned_run("result-variant", result_model)
+    mock_schedule_class.runs.return_value = Mock(data=[run], next_page_token=None)
+
+    response = service.get_schedule_runs(
+        SCHEDULE_RID,
+        page_size=20,
+        page_token="current-page",
+        request_timeout=7,
+    )
+
+    assert response["runs"][0]["result"] == expected_result
+    mock_schedule_class.runs.assert_called_once_with(
+        schedule_rid=SCHEDULE_RID,
+        page_size=20,
+        page_token="current-page",
+        request_timeout=7,
+    )
+
+
+def test_pinned_schedule_models_flow_through_wrappers_into_dependency_collector(
+    mock_orchestration_service,
+):
+    orchestration, mock_build_class, _, mock_schedule_class = mock_orchestration_service
+    trigger = AndTrigger(
+        triggers=[
+            DatasetUpdatedTrigger(
+                datasetRid="ri.foundry.main.dataset.trigger", branchName="master"
+            ),
+            OrTrigger(
+                triggers=[
+                    ScheduleSucceededTrigger(
+                        scheduleRid="ri.orchestration.main.schedule.upstream"
+                    ),
+                    ManualTrigger(),
+                ]
+            ),
+        ]
+    )
+    mock_schedule_class.get.return_value = pinned_schedule(
+        ConnectingTarget(
+            inputRids=["ri.foundry.main.dataset.input"],
+            targetRids=["ri.foundry.main.dataset.output"],
+            ignoredRids=[],
+        ),
+        trigger=trigger,
+        scope=ProjectScope(projectRids=["ri.compass.main.folder.project"]),
+    )
+    mock_schedule_class.get_affected_resources.return_value = AffectedResourcesResponse(
+        datasets=["ri.foundry.main.dataset.affected-output"]
+    )
+    mock_schedule_class.runs.return_value = Mock(
+        data=[
+            pinned_run(
+                "submitted",
+                ScheduleRunSubmitted(
+                    buildRid="ri.orchestration.main.build.submitted-build"
+                ),
+            ),
+            pinned_run("ignored", ScheduleRunIgnored()),
+            pinned_run(
+                "error",
+                ScheduleRunError(errorName="INTERNAL", description="failed safely"),
+            ),
+            pinned_run("absent", None),
+        ],
+        next_page_token=None,
+    )
+    mock_build_class.get.return_value = Build(
+        rid="ri.orchestration.main.build.submitted-build",
+        branchName="feature",
+        createdTime=datetime.now(timezone.utc),
+        createdBy=ACTOR_ID,
+        fallbackBranches=[],
+        jobRids=[],
+        retryCount=0,
+        retryBackoffDuration=Duration(value=1, unit="SECONDS"),
+        abortOnFailure=True,
+        status="SUCCEEDED",
+        scheduleRid=SCHEDULE_RID,
+    )
+    mock_build_class.jobs.return_value = Mock(data=[], next_page_token=None)
+
+    collector = DependencyGraphService(client=SimpleNamespace())
+    analysis = AnalysisContext.create(
+        profile="test",
+        host="https://example.palantirfoundry.com",
+        requested_branch="feature",
+    )
+    root_node = collector._add_node(
+        analysis,
+        "dataset",
+        "input",
+        {"resource_rid": "ri.foundry.main.dataset.input"},
+        True,
+    )
+    root = DependencyTarget(
+        "dataset",
+        root_node.identifiers,
+        root_node.display_name,
+        root_node.id,
+    )
+    schedule_node = collector._add_node(
+        analysis,
+        "schedule",
+        SCHEDULE_RID,
+        {"schedule_rid": SCHEDULE_RID},
+    )
+    records = {
+        surface: collector._coverage_record(
+            analysis, "schedule", surface, schedule_node.id
+        )
+        for surface in (
+            "schedule-detail-action",
+            "schedule-trigger",
+            "schedule-affected-resources",
+            "schedule-runs",
+        )
+    }
+
+    collector._collect_schedule(analysis, root, schedule_node, orchestration, records)
+
+    edges = list(analysis.edges.values())
+    assert sum(edge.relation_kind == "run-submitted-build" for edge in edges) == 1
+    assert sum(node.kind == "build" for node in analysis.nodes.values()) == 1
+    assert {edge.relation_kind for edge in edges} >= {
+        "schedule-consumes-resource",
+        "schedule-produces-resource",
+        "schedule-triggered-by-resource",
+        "project-scope",
+        "schedule-run",
+        "run-submitted-build",
+    }
+    evidence_locators = {evidence.locator for evidence in analysis.evidence.values()}
+    assert {
+        "action.target.input_rids[0]",
+        "action.target.target_rids[0]",
+        "scope_mode.project_rids[0]",
+        "trigger.triggers[0].dataset_rid",
+        "trigger.triggers[1].triggers[0].schedule_rid",
+        "runs[0].result.buildRid",
+    } <= evidence_locators
+    assert all(record.complete for record in records.values())
+    assert not any(
+        gap.reason_code.startswith("unknown-schedule-trigger")
+        for gap in analysis.gaps.values()
+    )
+    mock_schedule_class.get.assert_called_once()
+    mock_schedule_class.get_affected_resources.assert_called_once()
+    mock_schedule_class.runs.assert_called_once()
+    mock_build_class.get.assert_called_once()
+    mock_build_class.jobs.assert_called_once()
+    schedule_get_kwargs = mock_schedule_class.get.call_args.kwargs
+    assert set(schedule_get_kwargs) == {
+        "schedule_rid",
+        "preview",
+        "request_timeout",
+    }
+    assert schedule_get_kwargs["schedule_rid"] == SCHEDULE_RID
+    assert schedule_get_kwargs["preview"] is True
+    assert isinstance(schedule_get_kwargs["request_timeout"], int)
+    affected_kwargs = mock_schedule_class.get_affected_resources.call_args.kwargs
+    assert set(affected_kwargs) == {
+        "schedule_rid",
+        "preview",
+        "request_timeout",
+    }
+    assert affected_kwargs["schedule_rid"] == SCHEDULE_RID
+    assert affected_kwargs["preview"] is True
+    assert isinstance(affected_kwargs["request_timeout"], int)
+    runs_kwargs = mock_schedule_class.runs.call_args.kwargs
+    assert set(runs_kwargs) == {"schedule_rid", "page_size", "request_timeout"}
+    assert runs_kwargs["schedule_rid"] == SCHEDULE_RID
+    assert runs_kwargs["page_size"] == 100
+    assert isinstance(runs_kwargs["request_timeout"], int)
+    build_get_kwargs = mock_build_class.get.call_args.kwargs
+    assert set(build_get_kwargs) == {"build_rid", "request_timeout"}
+    assert (
+        build_get_kwargs["build_rid"] == "ri.orchestration.main.build.submitted-build"
+    )
+    assert isinstance(build_get_kwargs["request_timeout"], int)
+    jobs_kwargs = mock_build_class.jobs.call_args.kwargs
+    assert set(jobs_kwargs) == {"build_rid", "page_size", "request_timeout"}
+    assert jobs_kwargs["build_rid"] == "ri.orchestration.main.build.submitted-build"
+    assert jobs_kwargs["page_size"] == 100
+    assert isinstance(jobs_kwargs["request_timeout"], int)

@@ -932,18 +932,65 @@ class DatasetService(BaseService):
 
             return [
                 {
-                    "schedule_rid": getattr(schedule, "rid", None),
-                    "name": getattr(schedule, "name", None),
-                    "description": getattr(schedule, "description", None),
-                    "enabled": getattr(schedule, "enabled", None),
-                    "created_time": getattr(schedule, "created_time", None),
+                    # SDK 1.95.0 returns schedule RID strings from this endpoint.
+                    # Retain the historical dictionary contract consumed by the
+                    # schedules command and formatter.
+                    "schedule_rid": schedule
+                    if isinstance(schedule, str)
+                    else getattr(schedule, "rid", None),
+                    "name": None
+                    if isinstance(schedule, str)
+                    else getattr(schedule, "name", None),
+                    "description": None
+                    if isinstance(schedule, str)
+                    else getattr(schedule, "description", None),
+                    "enabled": None
+                    if isinstance(schedule, str)
+                    else getattr(schedule, "enabled", None),
+                    "created_time": None
+                    if isinstance(schedule, str)
+                    else getattr(schedule, "created_time", None),
                 }
                 for schedule in schedules
             ]
         except Exception as e:
             raise RuntimeError(
                 f"Failed to get schedules for dataset {dataset_rid}: {e}"
-            )
+            ) from e
+
+    def get_schedule_rids_page(
+        self,
+        dataset_rid: str,
+        *,
+        branch_name: Optional[str] = None,
+        page_size: Optional[int] = None,
+        page_token: Optional[str] = None,
+        request_timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch one explicit page of schedule RIDs for dependency discovery."""
+        kwargs: Dict[str, Any] = {"dataset_rid": dataset_rid}
+        if branch_name is not None:
+            kwargs["branch_name"] = branch_name
+        if page_size is not None:
+            kwargs["page_size"] = page_size
+        if page_token is not None:
+            kwargs["page_token"] = page_token
+        if request_timeout is not None:
+            kwargs["request_timeout"] = request_timeout
+
+        try:
+            page = self.service.Dataset.get_schedules(**kwargs)
+            data = list(getattr(page, "data", []))
+            if not all(isinstance(rid, str) for rid in data):
+                raise ValueError("Dataset.get_schedules returned a non-string RID")
+            return {
+                "schedule_rids": data,
+                "next_page_token": getattr(page, "next_page_token", None),
+            }
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to get schedule RID page for dataset {dataset_rid}: {e}"
+            ) from e
 
     def get_jobs(
         self, dataset_rid: str, branch: str = "master"

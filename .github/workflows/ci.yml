@@ -9,6 +9,8 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      CODECOV_ENABLED: ${{ secrets.CODECOV_TOKEN != '' }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -50,7 +52,12 @@ jobs:
         file: ./coverage.xml
         fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
-      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && env.CODECOV_ENABLED == 'true'
+
+    - name: Note Codecov upload skipped
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' && env.CODECOV_ENABLED == 'false'
+      run: |
+        printf '%s\n' '### Codecov upload skipped' 'CODECOV_TOKEN is unavailable; coverage was generated but not uploaded.' >> "$GITHUB_STEP_SUMMARY"
 
   lint-and-format:
     runs-on: ubuntu-latest

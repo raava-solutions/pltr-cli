@@ -153,3 +153,4 @@ credentials.json
 
 # ruff
 .ruff_cache/
+.omx/

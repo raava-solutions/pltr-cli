@@ -33,6 +33,7 @@ from pltr.commands import (
     data_health,
     audit,
     widgets,
+    dependency,
     mcp,
 )
 from pltr.commands.cp import cp_command
@@ -114,6 +115,11 @@ app.add_typer(
     admin.app,
     name="admin",
     help="Admin operations for user, group, and organization management",
+)
+app.add_typer(
+    dependency.app,
+    name="dependency",
+    help="Analyze Foundry dependency graphs and coverage",
 )
 app.add_typer(mcp.app, name="mcp", help="Manage MCP server integration")
 app.add_typer(shell.shell_app, name="shell", help="Interactive shell mode")

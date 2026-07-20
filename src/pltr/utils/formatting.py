@@ -4,6 +4,7 @@ Output formatting utilities for CLI commands.
 
 import json
 import csv
+import os
 from typing import Any, Dict, List, Optional, Union, Callable
 from datetime import datetime
 from io import StringIO
@@ -17,6 +18,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     pass
+
+
+class ProtectedOutputCollisionError(ValueError):
+    """Raised before truncation when rendered output aliases a protected artifact."""
 
 
 class OutputFormatter:
@@ -56,6 +61,356 @@ class OutputFormatter:
             return self._format_table(data, output_file)
         else:
             raise ValueError(f"Unsupported format type: {format_type}")
+
+    def format_dependency_result(
+        self,
+        result: Dict[str, Any],
+        format_type: str = "table",
+        output_file: Optional[str] = None,
+        full: bool = False,
+        protected_output_file: Optional[str] = None,
+        output_mode: str = "graph",
+    ) -> str:
+        """Render one already-complete dependency analysis without rediscovery."""
+        if format_type == "json":
+            rendered = (
+                json.dumps(
+                    self._make_json_serializable(result), indent=2, sort_keys=True
+                )
+                + "\n"
+            )
+        elif format_type == "csv":
+            rendered = self._format_dependency_csv(result)
+        elif format_type == "table":
+            if output_mode == "agent":
+                rendered = self._format_dependency_agent_table(result)
+            else:
+                rendered = self._format_dependency_table(result, full=full)
+        else:
+            raise ValueError(f"Unsupported format type: {format_type}")
+
+        if output_file:
+            self._write_dependency_output(
+                rendered,
+                output_file=output_file,
+                protected_output_file=protected_output_file,
+            )
+        elif format_type in {"json", "csv"}:
+            print(rendered, end="")
+        else:
+            self.console.print(rendered, markup=False, end="")
+        return rendered
+
+    @staticmethod
+    def _write_dependency_output(
+        rendered: str,
+        *,
+        output_file: str,
+        protected_output_file: Optional[str],
+    ) -> None:
+        """Open without truncation and reject an artifact inode before writing.
+
+        Comparing the opened descriptors closes the gap left by textual path
+        normalization: case-folded paths, hard links, and symlinks are rejected
+        even when the rendered destination did not exist during earlier checks.
+        """
+        protected_descriptor: Optional[int] = None
+        output_descriptor: Optional[int] = None
+        try:
+            if protected_output_file is not None:
+                protected_descriptor = os.open(protected_output_file, os.O_RDONLY)
+            output_descriptor = os.open(
+                output_file,
+                os.O_WRONLY | os.O_CREAT,
+                0o666,
+            )
+            if protected_descriptor is not None:
+                protected_stat = os.fstat(protected_descriptor)
+                output_stat = os.fstat(output_descriptor)
+                if (protected_stat.st_dev, protected_stat.st_ino) == (
+                    output_stat.st_dev,
+                    output_stat.st_ino,
+                ):
+                    raise ProtectedOutputCollisionError(
+                        "rendered output cannot replace the graph artifact"
+                    )
+            os.ftruncate(output_descriptor, 0)
+            with os.fdopen(output_descriptor, "w", encoding="utf-8") as handle:
+                output_descriptor = None
+                handle.write(rendered)
+        finally:
+            if output_descriptor is not None:
+                os.close(output_descriptor)
+            if protected_descriptor is not None:
+                os.close(protected_descriptor)
+
+    def _format_dependency_csv(self, result: Dict[str, Any]) -> str:
+        """Render the complete result as typed rows instead of a lossy summary."""
+        graph = result.get("graph") or {}
+        collections = (
+            (
+                "artifact",
+                [result["artifact"]]
+                if isinstance(result.get("artifact"), dict)
+                else [],
+            ),
+            (
+                "agent",
+                [result["agent"]] if isinstance(result.get("agent"), dict) else [],
+            ),
+            ("read-context", result.get("read_contexts", [])),
+            ("node", graph.get("nodes", result.get("nodes", []))),
+            ("edge", graph.get("edges", result.get("edges", []))),
+            ("path", result.get("paths", [])),
+            ("coverage", result.get("coverage_records", result.get("coverage", []))),
+            ("gap", result.get("gaps", [])),
+            ("error", result.get("errors", [])),
+            ("evidence", result.get("evidence", [])),
+            (
+                "operation-provenance",
+                result.get(
+                    "operation_provenance",
+                    result.get("operation_provenance_records", []),
+                ),
+            ),
+        )
+        rows: List[Dict[str, str]] = []
+        for row_kind, items in collections:
+            if isinstance(items, dict):
+                items = list(items.values())
+            for item in items or []:
+                value = self._make_json_serializable(item)
+                identifier = (
+                    value.get("id", value.get("analysis_id", ""))
+                    if isinstance(value, dict)
+                    else ""
+                )
+                rows.append(
+                    {
+                        "row_kind": row_kind,
+                        "id": str(identifier),
+                        "record": json.dumps(
+                            value, sort_keys=True, separators=(",", ":")
+                        ),
+                    }
+                )
+        output = StringIO()
+        writer = csv.DictWriter(output, fieldnames=["row_kind", "id", "record"])
+        writer.writeheader()
+        writer.writerows(rows)
+        return output.getvalue()
+
+    def _format_dependency_table(self, result: Dict[str, Any], full: bool) -> str:
+        target = result.get("target") or {}
+        target_label = (
+            target.get("display_name")
+            or target.get("id")
+            or target.get("kind")
+            or "unknown"
+        )
+        read_contexts = result.get("read_contexts") or []
+        if isinstance(read_contexts, dict):
+            read_contexts = list(read_contexts.values())
+        requested_branches = sorted(
+            {
+                str(context.get("requested_branch"))
+                for context in read_contexts
+                if isinstance(context, dict)
+                and context.get("requested_branch") is not None
+            }
+        )
+        summary = result.get("summary") or {}
+        assessment = (
+            summary.get("assessment")
+            or result.get("assessment")
+            or "Dependency analysis complete."
+        )
+        gaps = result.get("gaps") or []
+        budget = result.get("budget") or {}
+        artifact = result.get("artifact") or {}
+        paths = (
+            result.get("ranked_relationships")
+            or result.get("ranked_paths")
+            or result.get("paths")
+            or []
+        )
+
+        lines = [
+            "Dependency analysis",
+            f"Target: {target_label}",
+            f"Requested branch: {', '.join(requested_branches) if requested_branches else 'server default'}",
+            f"Assessment: {assessment}",
+        ]
+        chosen_paths = paths if full else paths[:1]
+        if chosen_paths:
+            lines.append("Relationships:")
+            for path in chosen_paths:
+                if not isinstance(path, dict):
+                    lines.append(f"  - {path}")
+                    continue
+                readable = (
+                    path.get("readable_path")
+                    or path.get("path")
+                    or path.get("node_labels")
+                    or path.get("id")
+                    or "unknown path"
+                )
+                if isinstance(readable, list):
+                    readable = " -> ".join(str(part) for part in readable)
+                direction = (
+                    path.get("direction")
+                    or path.get("root_relative_direction")
+                    or "adjacent"
+                )
+                evidence_summary = path.get("evidence_summary") or {}
+                locator = path.get("evidence_locator") or evidence_summary.get(
+                    "locator"
+                )
+                namespace = path.get("sdk_namespace") or evidence_summary.get(
+                    "sdk_namespace"
+                )
+                method = path.get("sdk_method") or evidence_summary.get("sdk_method")
+                suffix = ", ".join(
+                    part
+                    for part in (
+                        f"evidence {locator}" if locator else "",
+                        f"{namespace}.{method}"
+                        if namespace and method
+                        else namespace or method or "",
+                    )
+                    if part
+                )
+                lines.append(
+                    f"  - [{direction}] {readable}" + (f" ({suffix})" if suffix else "")
+                )
+        else:
+            lines.append("Relationships: none discovered within verified coverage")
+
+        reasons: Dict[str, int] = {}
+        for gap in gaps:
+            reason = (
+                gap.get("reason_code", "unknown")
+                if isinstance(gap, dict)
+                else "unknown"
+            )
+            reasons[reason] = reasons.get(reason, 0) + 1
+        gap_summary = (
+            ", ".join(f"{key}={reasons[key]}" for key in sorted(reasons)) or "none"
+        )
+        lines.append(f"Coverage gaps ({len(gaps)}): {gap_summary}")
+        stale_messages = sorted(
+            {
+                str(gap.get("message"))
+                for gap in gaps
+                if isinstance(gap, dict)
+                and gap.get("reason_code") == "schedule-index-may-be-stale"
+                and gap.get("message")
+            }
+        )
+        for message in stale_messages:
+            lines.append(f"Coverage note: {message}")
+        if full:
+            for gap in gaps:
+                if isinstance(gap, dict):
+                    lines.append(
+                        f"  - {gap.get('surface', 'unknown')}: "
+                        f"{gap.get('reason_code', 'unknown')} - {gap.get('message', '')}"
+                    )
+        used = budget.get("used", {}) if isinstance(budget, dict) else {}
+        limits = budget.get("limits", {}) if isinstance(budget, dict) else {}
+        dimensions = sorted(set(used) | set(limits))
+        budget_summary = (
+            ", ".join(
+                f"{dimension}={used.get(dimension, 0)}/{limits.get(dimension, '?')}"
+                for dimension in dimensions
+            )
+            or "not reported"
+        )
+        lines.append(f"Budget: {budget_summary}")
+        agent = result.get("agent") or {}
+        if agent:
+            verification = agent.get("verification") or {}
+            groups = (agent.get("blast_radius") or {}).get("groups") or {}
+            lines.append(
+                "Agent verification: "
+                f"must={len(verification.get('must_verify_before_merge', []))} "
+                f"should={len(verification.get('should_verify_before_deploy', []))} "
+                f"unsupported={len(verification.get('unsupported_manual_surfaces', []))}"
+            )
+            lines.append(
+                "Agent blast radius: "
+                f"critical={len(groups.get('critical_paths', []))} "
+                f"structural={len(groups.get('structural_dependents', []))} "
+                f"indirect={len(groups.get('indirect_operational_effects', []))} "
+                f"unknown={len(groups.get('unknown_manual_verification', []))}"
+            )
+        lines.extend(
+            [
+                f"Analysis ID: {artifact.get('analysis_id', '')}",
+                f"Graph artifact: {artifact.get('path', '')}",
+                f"SHA-256: {artifact.get('sha256', '')}",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _format_dependency_agent_table(self, result: Dict[str, Any]) -> str:
+        """Compact agent-mode rendering built from the agent block (AU7)."""
+        agent = result.get("agent") or {}
+        artifact = result.get("artifact") or {}
+        verification = agent.get("verification") or {}
+        completeness = agent.get("coverage_completeness") or {}
+        lines = [
+            f"Dependency impact assessment [{agent.get('schema_version', 'unknown')}]",
+            f"Status: {agent.get('status', 'unknown')}",
+            f"Summary: {agent.get('summary', '')}",
+            f"Coverage: {'complete' if completeness.get('complete') else 'TRUNCATED'}",
+        ]
+        change = agent.get("change") or {}
+        if change.get("text") or change.get("change_type"):
+            lines.append(
+                "Change: "
+                + ", ".join(
+                    part
+                    for part in (
+                        str(change.get("text")) if change.get("text") else "",
+                        f"type={change.get('change_type')}"
+                        if change.get("change_type")
+                        else "",
+                        f"source={change.get('change_type_source')}",
+                    )
+                    if part
+                )
+            )
+        blast = agent.get("blast_radius") or {}
+        release = agent.get("release_risk") or {}
+        lines.append(
+            f"Blast radius: {blast.get('score')}/100 "
+            f"(release risk: {release.get('score') if release.get('score') is not None else 'n/a'})"
+        )
+        for bucket, label in (
+            ("must_verify_before_merge", "MUST verify before merge"),
+            ("should_verify_before_deploy", "SHOULD verify before deploy"),
+            ("unsupported_manual_surfaces", "Unsupported/manual surfaces"),
+        ):
+            items = verification.get(bucket) or []
+            lines.append(f"{label} ({len(items)}):")
+            for item in items[:10]:
+                subject = (
+                    item.get("subject_display_name")
+                    or item.get("subject_node_id")
+                    or "(analysis-wide)"
+                )
+                reason = item.get("reason", "impact")
+                lines.append(f"  - [{reason}] {subject}")
+            if len(items) > 10:
+                lines.append(f"  ... {len(items) - 10} more (see graph artifact)")
+        lines.extend(
+            [
+                f"Analysis ID: {artifact.get('analysis_id', '')}",
+                f"Graph artifact: {artifact.get('path', '')}",
+            ]
+        )
+        return "\n".join(lines) + "\n"
 
     def _format_json(
         self, data: Any, output_file: Optional[str] = None

@@ -1,6 +1,6 @@
 ---
 name: pltr-cli
-description: Helps you work with Palantir Foundry using the pltr CLI. Use this when you need to query datasets, manage orchestration builds, work with ontologies, run SQL queries, manage folders/spaces/projects, copy datasets, or perform admin operations in Foundry. Triggers: Foundry, pltr, dataset, SQL query, ontology, build, schedule, RID.
+description: Helps you work with Palantir Foundry using the pltr CLI. Use this when you need to analyze dependencies, query datasets, manage orchestration builds, work with ontologies, run SQL queries, manage folders/spaces/projects, copy datasets, or perform admin operations in Foundry. Triggers: Foundry, pltr, dependency, dataset, SQL query, ontology, build, schedule, RID.
 ---
 
 # pltr-cli: Palantir Foundry CLI
@@ -11,8 +11,8 @@ This skill helps you use the pltr-cli to interact with Palantir Foundry effectiv
 
 - **Skill version**: 1.1.0
 - **pltr-cli version**: 0.12.0+
-- **Python**: 3.9, 3.10, 3.11, 3.12
-- **Dependencies**: foundry-platform-sdk >= 1.69.0
+- **Python**: 3.10, 3.11, 3.12
+- **Dependencies**: foundry-platform-sdk == 1.95.0
 
 ## Overview
 
@@ -30,6 +30,7 @@ pltr-cli is a comprehensive CLI with 100+ commands for:
 - **Functions**: Execute queries and inspect value types
 - **AIP Agents**: Manage AI agents, sessions, and versions
 - **Models**: ML model registry for model and version management
+- **Dependency analysis**: Evidence-backed dependency paths, coverage gaps, provenance, and complete local graph artifacts
 
 ## Critical Concepts
 
@@ -93,6 +94,7 @@ Load these files based on the user's task:
 | Functions queries, value types | `reference/functions-commands.md` |
 | AIP Agents, sessions, versions | `reference/aip-agents-commands.md` |
 | ML model registry, model versions | `reference/models-commands.md` |
+| Dependency and change-impact analysis | `reference/dependency-commands.md` |
 
 ## Workflow Files
 
@@ -118,6 +120,9 @@ pltr sql execute "SELECT * FROM my_table LIMIT 10"
 
 # Get dataset info
 pltr dataset get ri.foundry.main.dataset.abc123
+
+# Analyze observed dependencies and retain the complete graph artifact
+pltr dependency resource ri.foundry.main.dataset.abc123 --change "rename a column"
 
 # List files in dataset
 pltr dataset files list ri.foundry.main.dataset.abc123

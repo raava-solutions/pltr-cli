@@ -523,3 +523,58 @@ def test_add_backing_datasets_success(mock_dataset_service):
     mock_view_class.add_backing_datasets.assert_called_once_with(
         dataset_rid="ri.foundry.main.view.test", backing_datasets=dataset_rids
     )
+
+
+def test_get_schedule_rids_page_preserves_strings_token_and_exact_kwargs(
+    mock_dataset_service,
+):
+    service, mock_dataset_class = mock_dataset_service
+    page = Mock()
+    page.data = [
+        "ri.orchestration.main.schedule.one",
+        "ri.orchestration.main.schedule.two",
+    ]
+    page.next_page_token = "next-page"
+    mock_dataset_class.get_schedules.return_value = page
+
+    result = service.get_schedule_rids_page(
+        "ri.foundry.main.dataset.input",
+        branch_name="feature",
+        page_size=25,
+        page_token="current-page",
+        request_timeout=17,
+    )
+
+    assert result == {
+        "schedule_rids": [
+            "ri.orchestration.main.schedule.one",
+            "ri.orchestration.main.schedule.two",
+        ],
+        "next_page_token": "next-page",
+    }
+    mock_dataset_class.get_schedules.assert_called_once_with(
+        dataset_rid="ri.foundry.main.dataset.input",
+        branch_name="feature",
+        page_size=25,
+        page_token="current-page",
+        request_timeout=17,
+    )
+
+
+def test_get_schedules_adapts_sdk_rids_to_public_dictionary_contract(
+    mock_dataset_service,
+):
+    service, mock_dataset_class = mock_dataset_service
+    mock_dataset_class.get_schedules.return_value = iter(
+        ["ri.orchestration.main.schedule.one"]
+    )
+
+    assert service.get_schedules("ri.foundry.main.dataset.input") == [
+        {
+            "schedule_rid": "ri.orchestration.main.schedule.one",
+            "name": None,
+            "description": None,
+            "enabled": None,
+            "created_time": None,
+        }
+    ]

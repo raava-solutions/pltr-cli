@@ -86,7 +86,9 @@ def update_version_in_init_py(new_version):
         )
         return
 
-    print("Error: Could not find a supported __version__ definition in src/pltr/__init__.py")
+    print(
+        "Error: Could not find a supported __version__ definition in src/pltr/__init__.py"
+    )
     sys.exit(1)
 
 

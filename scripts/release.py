@@ -69,20 +69,25 @@ def update_version_in_init_py(new_version):
     # Read the current content
     content = init_py_path.read_text()
 
-    # Update the version using regex
-    import re
-
     pattern = r'__version__ = "[^"]+"'
     replacement = f'__version__ = "{new_version}"'
 
-    if not re.search(pattern, content):
-        print("Error: Could not find __version__ in src/pltr/__init__.py")
-        sys.exit(1)
+    if re.search(pattern, content):
+        updated_content = re.sub(pattern, replacement, content)
+        init_py_path.write_text(updated_content)
+        print(f"Updated src/pltr/__init__.py __version__ to {new_version}")
+        return
 
-    updated_content = re.sub(pattern, replacement, content)
-    init_py_path.write_text(updated_content)
+    metadata_pattern = r'__version__ = version\("pltr-cli"\)'
+    if re.search(metadata_pattern, content):
+        print(
+            "src/pltr/__init__.py derives __version__ from package metadata; "
+            "pyproject.toml is the version source"
+        )
+        return
 
-    print(f"Updated src/pltr/__init__.py __version__ to {new_version}")
+    print("Error: Could not find a supported __version__ definition in src/pltr/__init__.py")
+    sys.exit(1)
 
 
 def validate_version(version):

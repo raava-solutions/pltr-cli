@@ -5,6 +5,8 @@ These tests verify end-to-end command execution with mocked Foundry API response
 """
 
 import json
+from importlib.metadata import version
+
 from unittest.mock import Mock, patch
 from typer.testing import CliRunner
 import pytest
@@ -59,7 +61,7 @@ class TestCLIIntegration:
         """Test version display."""
         result = runner.invoke(app, ["--version"])
         assert result.exit_code == 0
-        assert "pltr" in result.output.lower() or "version" in result.output.lower()
+        assert result.output == f"pltr {version('pltr-cli')}\n"
 
     @pytest.mark.skip(
         reason="Requires real credentials and network access - skipped in CI"

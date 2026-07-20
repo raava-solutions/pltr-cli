@@ -337,8 +337,8 @@ tests/
     test_dependency_artifacts.py              atomic path/digest/permission tests
 
 docs/user-guide/commands.md
-claude_skill/reference/dependency-commands.md
-claude_skill/SKILL.md
+skills/pltr-cli/reference/dependency-commands.md
+skills/pltr-cli/SKILL.md
 README.md
 ```
 
@@ -634,8 +634,8 @@ The shared runner creates one `AnalysisContext`, resolves once, analyzes once, w
 
 **Files:**
 - `docs/user-guide/commands.md`
-- `claude_skill/reference/dependency-commands.md` (new)
-- `claude_skill/SKILL.md`
+- `skills/pltr-cli/reference/dependency-commands.md` (new)
+- `skills/pltr-cli/SKILL.md`
 - `README.md`
 
 Document all six commands, per-operation branch/preview/SDK provenance, global budgets, graph-output path/retention, dependency-flow versus adjacent-structural traversal, deterministic error classes, and the coverage matrix legend. Dataset examples must say that returned schedule RIDs are verified but the reverse index may lag by up to one hour, so empty success is partial rather than proof of no consumers. Examples must show the graph reference and must not claim Workshop internals, standalone Function reverse wiring, dynamically resolved upstream lineage, or application wiring are discoverable (CAP-06, CAP-16).

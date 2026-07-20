@@ -27,6 +27,9 @@ addressed by a resolvable Compass RID, and its internal wiring remains a gap.
 --profile PROFILE
 --branch BRANCH
 --change TEXT
+--change-type rename|type-change|optional-to-required|required-to-optional|remove-delete|action-input-change|query-output-change
+--compare-artifact PATH
+--output-mode graph|agent|ci
 --direction both|upstream|downstream|adjacent
 --depth N                       default 2, hard ceiling 10
 --max-nodes N                   default 150, hard ceiling 1000
@@ -47,6 +50,10 @@ namespace/method, capability IDs, installed invocation SDK version, timestamps,
 known limitations, and request timeout. A branchless call never inherits the
 requested branch in its provenance.
 
+`--change-type` is additive to `--change`. An explicit enum controls
+change-aware classification and scoring; free text remains human context.
+When omitted, change type may be inferred and is labeled as such.
+
 ## Output and artifact contract
 
 Every success writes a mandatory complete JSON artifact atomically with mode
@@ -56,21 +63,55 @@ Every success writes a mandatory complete JSON artifact atomically with mode
 ${XDG_STATE_HOME:-~/.local/state}/pltr/dependency/<analysis-id>.json
 ```
 
-Artifact retention is operator-managed. `--output` is independent and controls
-only the rendered result. The default compact table shows the target/read
+Artifact retention is operator-managed. In `graph` and `agent` modes,
+`--output` independently controls the rendered result; `ci` emits its one-line
+gate payload to stdout. The default compact table shows the target/read
 context, assessment, top root-relative path and evidence locator, SDK operation,
 coverage-gap reasons, budget use, absolute artifact path, analysis ID, and
 SHA-256 digest. `--full` expands only the table. JSON retains the complete
 result. CSV uses explicit row kinds: `node`, `edge`, `path`, `coverage`, `gap`,
 `error`, `evidence`, and `operation-provenance`.
 
+`--output-mode graph` returns the complete result. `agent` returns the compact
+machine contract with status, ranked impacts, independent blast-radius and
+release-risk scores, action/query contracts, coverage completeness,
+`must_verify_before_merge`, `should_verify_before_deploy`, and an artifact
+reference. `ci` returns the minimal gate payload and exits `0` when clean, `2`
+when verification is required, and `1` on fatal failure.
+
+`--compare-artifact` validates a retained artifact before discovery and reports
+edge additions, removals, coverage changes, newly introduced impacts, budget
+comparability, and possible truncation. In CI mode, malformed, oversized,
+non-regular, or schema-incompatible comparison artifacts fail closed.
+
 ```bash
+# Pre-change baseline for agent reasoning
 pltr dependency property ri.ontology.main.ontology.example Employee email \
   --branch dev \
   --change "change email from string to struct" \
+  --change-type type-change \
   --direction downstream \
-  --graph-output ./employee-email-dependencies.json
+  --output-mode agent \
+  --graph-output ./employee-email-before.json
+
+# Post-change comparison for merge gating
+pltr dependency property ri.ontology.main.ontology.example Employee email \
+  --branch dev \
+  --change "change email from string to struct" \
+  --change-type type-change \
+  --direction downstream \
+  --compare-artifact ./employee-email-before.json \
+  --output-mode ci \
+  --graph-output ./employee-email-after.json
 ```
+
+## Agent assessment contract
+
+Use `workflows/change-impact-assessment.md` for the full operating sequence.
+The compact agent result must be interpreted from `status` through verification,
+coverage, contracts, and artifact reference. A `needs-verification` status is a
+merge gate. Coverage gaps preserve uncertainty and must never be summarized as
+“no impact.”
 
 ## Reading paths and coverage
 

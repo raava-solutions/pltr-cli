@@ -2,6 +2,44 @@
 
 This guide covers real-world data analysis patterns and workflows using pltr-cli. Learn how to combine commands effectively for common tasks.
 
+## Foundry Change-Impact Gate
+
+Before changing an ontology resource, action, query, dataset, application, or
+other Compass resource, run the read-only dependency workflow and retain a
+baseline:
+
+```bash
+pltr dependency object-type "$ONTOLOGY_RID" "$OBJECT_TYPE" \
+  --profile "$PROFILE" \
+  --branch "$BRANCH" \
+  --change "rename proposalName" \
+  --change-type rename \
+  --direction both \
+  --depth 3 \
+  --output-mode agent \
+  --graph-output ./artifacts/change-impact-before.json
+```
+
+Resolve the relevant `must_verify_before_merge` items. Treat incomplete coverage
+as uncertainty. After the change, rerun the same target and budgets with:
+
+```bash
+pltr dependency object-type "$ONTOLOGY_RID" "$OBJECT_TYPE" \
+  --profile "$PROFILE" \
+  --branch "$BRANCH" \
+  --change "rename proposalName" \
+  --change-type rename \
+  --direction both \
+  --depth 3 \
+  --compare-artifact ./artifacts/change-impact-before.json \
+  --output-mode ci \
+  --graph-output ./artifacts/change-impact-after.json
+```
+
+Exit `0` is clean, `2` needs verification, and `1` is fatal. The full agent
+workflow and interpretation rules live in
+`skills/pltr-cli/workflows/change-impact-assessment.md`.
+
 ## 📊 Data Analysis Workflows
 
 ### Basic Data Exploration

@@ -7,6 +7,7 @@ import pytest
 import requests
 
 from pltr.services.dependency import (
+    CONSUMER_OSDK_IMPACT_SURFACE,
     TRANSFORM_DATASET_LINEAGE_SURFACE,
     DependencyGraphService,
     DependencyTarget,
@@ -16,6 +17,7 @@ from pltr.services.dependency_internal_specs import (
     ACP_OPERATION_SPECS,
     ACP_05_DEPENDENTS_PAGE_BOUNDARY,
     CONJURE_POST_OPERATION_SPECS,
+    CONSUMER_CHARACTERIZATION_OPERATION_SPECS,
     GET_OBJECT_TYPE_DEPENDENTS_QUERY,
     GRAPHQL_OPERATION_SPECS,
     TRANSFORM_LINEAGE_GET_OPERATION_SPECS,
@@ -114,6 +116,10 @@ def _analyze_object(
     internal_budget=None,
     graph_budget=None,
     requested_branch="feature",
+    osdk_response=None,
+    osdk_error=None,
+    app_response=None,
+    compass_response=None,
 ):
     internal_client = SimpleNamespace(graphql=Mock(), conjure=Mock())
     dependents = (
@@ -139,6 +145,25 @@ def _analyze_object(
     def conjure(verb, path, **kwargs):
         if "includeDatasources" in path:
             return _property_mapping_response()
+        if path.endswith("/entity-sdk-versions"):
+            assert verb == "PUT"
+            if osdk_error is not None:
+                raise osdk_error
+            return osdk_response or (
+                403,
+                {"errorName": "Default:PermissionDenied"},
+                "denied",
+            )
+        if "/api/applications/" in path:
+            assert verb == "GET"
+            return app_response or (404, {"errorName": "Default:NotFound"}, "missing")
+        if path.startswith("/compass/api/resources/"):
+            assert verb == "GET"
+            return compass_response or (
+                404,
+                {"errorName": "Default:NotFound"},
+                "missing",
+            )
         assert verb == "POST"
         assert path == "/monocle/api/links/graphV3"
         if monocle_error is not None:
@@ -574,6 +599,401 @@ def test_phase_b_post_specs_do_not_widen_the_get_only_acp_registry():
     assert GRAPHQL_OPERATION_SPECS["ACP-05"].transport == "graphql-sse"
     assert CONJURE_POST_OPERATION_SPECS["ACP-02"].verb == "POST"
     assert CONJURE_POST_OPERATION_SPECS["ACP-06"].verb == "POST"
+    assert set(CONSUMER_CHARACTERIZATION_OPERATION_SPECS) == {"ACP-07"}
+    assert CONSUMER_CHARACTERIZATION_OPERATION_SPECS["ACP-07"].verb == "PUT"
+
+
+def test_acp_07_enriches_existing_app_edge_with_osdk_range_and_app_details():
+    object_type_rid = "ri.ontology.main.object-type.program"
+    app_rid = "ri.third-party-applications.main.application.consumer"
+    result, internal_client = _analyze_object(
+        [_dependent(app_rid, "Application", "Consumer App")],
+        osdk_response=(
+            200,
+            {"sdkVersions": {object_type_rid: {"oldest": "0.4.0", "latest": "0.6.0"}}},
+            "{}",
+        ),
+        app_response=(
+            200,
+            {
+                "name": "Consumer App",
+                "subdomains": ["consumer"],
+                "scopes": {"dataScope": [object_type_rid]},
+                "listSdks": [{"version": "0.6.0"}],
+            },
+            "{}",
+        ),
+    )
+
+    edge = next(
+        edge
+        for edge in result["graph"]["edges"]
+        if edge["relation_kind"] == "object-consumed-by-app"
+    )
+    assert edge["attributes"]["osdk_version_range"] == {
+        "oldest": "0.4.0",
+        "latest": "0.6.0",
+    }
+    assert edge["attributes"]["application"] == {
+        "name": "Consumer App",
+        "subdomains": ["consumer"],
+        "scopes": {"dataScope": [object_type_rid]},
+    }
+    assert len(edge["evidence_ids"]) == 3
+    assert any(
+        item["surface"] == CONSUMER_OSDK_IMPACT_SURFACE and item["status"] == "covered"
+        for item in result["coverage"]
+    )
+    osdk_call = next(
+        call
+        for call in internal_client.conjure.call_args_list
+        if call.args[1].endswith("/entity-sdk-versions")
+    )
+    assert osdk_call.args[0] == "PUT"
+    assert osdk_call.kwargs["json_body"] == {"entityRids": [object_type_rid]}
+
+
+def test_empty_sdk_versions_with_empty_list_sdks_marks_live_break_but_is_inconclusive():
+    app_rid = "ri.third-party-applications.main.application.live"
+    result, _ = _analyze_object(
+        [_dependent(app_rid, "Application", "Live App")],
+        osdk_response=(200, {"sdkVersions": {}}, "{}"),
+        app_response=(
+            200,
+            {
+                "name": "Live App",
+                "subdomains": ["live"],
+                "scopes": {"dataScope": []},
+                "listSdks": [],
+            },
+            "{}",
+        ),
+    )
+
+    edge = next(
+        edge
+        for edge in result["graph"]["edges"]
+        if edge["relation_kind"] == "object-consumed-by-app"
+    )
+    assert edge["attributes"]["breaks_live"] is True
+    assert edge["attributes"]["via_stale_bundle"] is False
+    assert edge["attributes"]["osdk_impact"] == ("breaks-live-not-via-stale-bundle")
+    statuses = [
+        item["status"]
+        for item in result["coverage"]
+        if item["surface"] == CONSUMER_OSDK_IMPACT_SURFACE
+    ]
+    assert statuses == ["inconclusive"]
+    assert "covered-empty" not in statuses
+
+
+def test_permission_denied_acp_07_is_inconclusive_not_no_impact():
+    app_rid = "ri.third-party-applications.main.application.denied"
+    result, _ = _analyze_object(
+        [_dependent(app_rid, "Application", "Denied App")],
+        osdk_response=(
+            403,
+            {"errorName": "Default:PermissionDenied"},
+            "denied",
+        ),
+        app_response=(
+            200,
+            {
+                "name": "Denied App",
+                "subdomains": [],
+                "scopes": {"dataScope": []},
+                "listSdks": [{"version": "0.6.0"}],
+            },
+            "{}",
+        ),
+    )
+
+    coverage = next(
+        item
+        for item in result["coverage"]
+        if item["surface"] == CONSUMER_OSDK_IMPACT_SURFACE
+    )
+    assert coverage["status"] == "inconclusive"
+    assert coverage["status"] != "covered-empty"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["workshop-module", "notepad", "application", "dataset"],
+)
+def test_acp_08_names_each_bare_consumer_kind(kind):
+    rid = f"ri.compass.main.{kind}.bare"
+    payload = {
+        "rid": rid,
+        "name": f"Named {kind}",
+        "path": f"/Consumers/{kind}",
+        "inTrash": kind == "notepad",
+    }
+    internal_client = SimpleNamespace(conjure=Mock(return_value=(200, payload, "{}")))
+    service = DependencyGraphService(
+        client=SimpleNamespace(),
+        conjure_provider=ConjureRestProvider(internal_client),
+    )
+    analysis = service.create_context(host="https://example.test")
+    node = service._add_node(analysis, kind, rid, {"resource_rid": rid})
+
+    service._name_bare_consumer_rids(analysis, ACP_OPERATION_SPECS["ACP-08"], [node.id])
+
+    named = analysis.nodes[node.id]
+    assert named.display_name == f"Named {kind}"
+    assert named.identifiers["path"] == f"/Consumers/{kind}"
+    assert named.identifiers["in_trash"] == str(kind == "notepad").lower()
+    call = internal_client.conjure.call_args
+    assert call.args == (
+        "GET",
+        ACP_OPERATION_SPECS["ACP-08"].path.format(rid=quote(rid, safe="")),
+    )
+
+
+def test_acp_08_not_found_leaves_raw_rid_and_reports_unresolved_locator():
+    rid = "ri.notepad.main.notepad.missing"
+    internal_client = SimpleNamespace(
+        conjure=Mock(return_value=(404, {"errorName": "Default:NotFound"}, "missing"))
+    )
+    service = DependencyGraphService(
+        client=SimpleNamespace(),
+        conjure_provider=ConjureRestProvider(internal_client),
+    )
+    analysis = service.create_context(host="https://example.test")
+    node = service._add_node(analysis, "notepad", rid, {"resource_rid": rid})
+
+    service._name_bare_consumer_rids(analysis, ACP_OPERATION_SPECS["ACP-08"], [node.id])
+
+    locator = ACP_OPERATION_SPECS["ACP-08"].path.format(rid=quote(rid, safe=""))
+    assert analysis.nodes[node.id].display_name == rid
+    assert any(
+        gap.operation == "ACP-08"
+        and gap.coverage == "unresolved"
+        and gap.locator == locator
+        for gap in analysis.gaps.values()
+    )
+
+
+def test_acp_08_does_not_retry_a_completed_unresolved_name_lookup():
+    rid = "ri.notepad.main.notepad.missing"
+    internal_client = SimpleNamespace(
+        conjure=Mock(return_value=(404, {"errorName": "Default:NotFound"}, "missing"))
+    )
+    service = DependencyGraphService(
+        client=SimpleNamespace(),
+        conjure_provider=ConjureRestProvider(internal_client),
+    )
+    analysis = service.create_context(host="https://example.test")
+    node = service._add_node(analysis, "notepad", rid, {"resource_rid": rid})
+
+    service._name_bare_consumer_rids(analysis, ACP_OPERATION_SPECS["ACP-08"], [node.id])
+    service._name_bare_consumer_rids(analysis, ACP_OPERATION_SPECS["ACP-08"], [node.id])
+
+    internal_client.conjure.assert_called_once()
+    assert analysis.internal_budget.used_requests == 1
+
+
+def test_consumer_characterization_token_expiry_is_a_distinct_gap():
+    app_rid = "ri.third-party-applications.main.application.expired"
+    result, _ = _analyze_object(
+        [_dependent(app_rid, "Application", "Expired App")],
+        osdk_error=TokenExpiredError("expired"),
+    )
+
+    assert any(
+        item["surface"] == CONSUMER_OSDK_IMPACT_SURFACE
+        and item["status"] == "token-expired"
+        and item["reason"] == "token-expired"
+        for item in result["coverage"]
+    )
+    assert any(
+        gap["operation"] == "ACP-07"
+        and gap["reason_code"] == "token-expired"
+        and gap["coverage"] == "token-expired"
+        for gap in result["gaps"]
+    )
+
+
+def test_acp_08_only_names_scoped_consumers():
+    consumer_rid = "ri.notepad.main.notepad.consumer"
+    unrelated_rid = "ri.foundry.main.dataset.unrelated"
+    payload = {
+        "rid": consumer_rid,
+        "name": "Consumer Notepad",
+        "path": "/Consumers/Notepad",
+        "inTrash": False,
+    }
+    internal_client = SimpleNamespace(conjure=Mock(return_value=(200, payload, "{}")))
+    service = DependencyGraphService(
+        client=SimpleNamespace(),
+        conjure_provider=ConjureRestProvider(internal_client),
+    )
+    analysis = service.create_context(host="https://example.test")
+    consumer = service._add_node(
+        analysis, "notepad", consumer_rid, {"resource_rid": consumer_rid}
+    )
+    unrelated = service._add_node(
+        analysis, "dataset", unrelated_rid, {"resource_rid": unrelated_rid}
+    )
+
+    service._name_bare_consumer_rids(
+        analysis, ACP_OPERATION_SPECS["ACP-08"], [consumer.id]
+    )
+
+    internal_client.conjure.assert_called_once()
+    assert analysis.nodes[consumer.id].display_name == "Consumer Notepad"
+    assert analysis.nodes[unrelated.id].display_name == unrelated_rid
+    assert not any(
+        record.subject_node_id == unrelated.id and record.surface == "compass-metadata"
+        for record in analysis.coverage_records.values()
+    )
+
+
+def test_consumer_characterization_does_not_name_unrelated_graph_nodes():
+    object_type_rid = "ri.ontology.main.object-type.program"
+    app_rid = "ri.third-party-applications.main.application.bare"
+    result, internal_client = _analyze_object(
+        [_dependent(app_rid, "Application")],
+        osdk_response=(
+            200,
+            {"sdkVersions": {object_type_rid: {"oldest": "0.4.0", "latest": "0.6.0"}}},
+            "{}",
+        ),
+        app_response=(
+            200,
+            {
+                "name": "Bare App",
+                "subdomains": ["bare"],
+                "scopes": {"dataScope": [object_type_rid]},
+                "listSdks": [{"version": "0.6.0"}],
+            },
+            "{}",
+        ),
+        compass_response=(
+            200,
+            {
+                "rid": app_rid,
+                "name": "Named Bare App",
+                "path": "/Consumers/Bare App",
+                "inTrash": False,
+            },
+            "{}",
+        ),
+    )
+
+    compass_calls = [
+        call
+        for call in internal_client.conjure.call_args_list
+        if call.args[1].startswith("/compass/api/resources/")
+    ]
+    assert len(compass_calls) == 1
+    assert quote(app_rid, safe="") in compass_calls[0].args[1]
+    assert any(node["kind"] == "dataset-column" for node in result["graph"]["nodes"])
+
+
+def test_acp_08_token_expiry_is_a_distinct_gap_and_aborts_remaining_names():
+    rid = "ri.notepad.main.notepad.expired"
+    second_rid = "ri.compass.main.workshop-module.unattempted"
+    internal_client = SimpleNamespace(
+        conjure=Mock(side_effect=TokenExpiredError("expired"))
+    )
+    service = DependencyGraphService(
+        client=SimpleNamespace(),
+        conjure_provider=ConjureRestProvider(internal_client),
+    )
+    analysis = service.create_context(host="https://example.test")
+    node = service._add_node(analysis, "notepad", rid, {"resource_rid": rid})
+    second = service._add_node(
+        analysis, "workshop-module", second_rid, {"resource_rid": second_rid}
+    )
+
+    service._name_bare_consumer_rids(
+        analysis, ACP_OPERATION_SPECS["ACP-08"], [node.id, second.id]
+    )
+
+    attempted_id, unattempted_id = sorted((node.id, second.id))
+    record = next(
+        item
+        for item in analysis.coverage_records.values()
+        if item.subject_node_id == attempted_id and item.surface == "compass-metadata"
+    )
+    assert record.status == "token-expired"
+    assert record.reason == "token-expired"
+    internal_client.conjure.assert_called_once()
+    assert not any(
+        item.subject_node_id == unattempted_id and item.surface == "compass-metadata"
+        for item in analysis.coverage_records.values()
+    )
+    assert any(
+        gap.operation == "ACP-08"
+        and gap.reason_code == "token-expired"
+        and gap.coverage == "token-expired"
+        for gap in analysis.gaps.values()
+    )
+
+
+def test_resource_collection_preserves_completed_compass_failure():
+    rid = "ri.third-party-applications.main.third-party-application.consumer"
+    get = Mock(return_value=SimpleNamespace(rid=rid))
+    service = DependencyGraphService(
+        client=SimpleNamespace(
+            third_party_applications=SimpleNamespace(
+                ThirdPartyApplication=SimpleNamespace(get=get)
+            )
+        )
+    )
+    analysis = service.create_context(host="https://example.test")
+    node = service._add_node(
+        analysis, "third-party-application", rid, {"resource_rid": rid}
+    )
+    record = service._coverage_record(
+        analysis,
+        node.kind,
+        "compass-metadata",
+        node.id,
+        operation="ACP-08",
+        transport="conjure-rest",
+        empty_is_inconclusive=True,
+    )
+    service._finish_coverage(record, "unresolved", reason="not-found")
+
+    service._collect_resource(
+        DependencyTarget(node.kind, node.identifiers, node.display_name, node.id),
+        analysis,
+    )
+
+    assert record.status == "unresolved"
+    assert record.reason == "not-found"
+    get.assert_called_once()
+
+
+def test_dataset_collection_preserves_completed_compass_failure():
+    rid = "ri.foundry.main.dataset.consumer"
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = service.create_context(host="https://example.test")
+    node = service._add_node(analysis, "dataset", rid, {"resource_rid": rid})
+    record = service._coverage_record(
+        analysis,
+        node.kind,
+        "compass-metadata",
+        node.id,
+        operation="ACP-08",
+        transport="conjure-rest",
+        empty_is_inconclusive=True,
+    )
+    service._finish_coverage(record, "unresolved", reason="not-found")
+
+    with patch(
+        "pltr.services.dependency.DatasetService.get_schedule_rids_page",
+        return_value={"schedule_rids": [], "next_page_token": None},
+    ):
+        service._collect_dataset(
+            DependencyTarget(node.kind, node.identifiers, node.display_name, node.id),
+            analysis,
+        )
+
+    assert record.status == "unresolved"
+    assert record.reason == "not-found"
 
 
 def _lineage_target(service, analysis, dataset_rid="ri.foundry.main.dataset.output"):

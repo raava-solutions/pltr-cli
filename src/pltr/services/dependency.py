@@ -283,6 +283,7 @@ class Edge:
     intrinsic_orientation: str
     evidence_ids: tuple[str, ...]
     coverage: str = "verified"
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -600,6 +601,7 @@ STATIC_SURFACES = (
 )
 
 OBJECT_TYPE_CONSUMER_SURFACE = "object-type-consumers"
+CONSUMER_OSDK_IMPACT_SURFACE = "consumer-osdk-impact"
 TRANSFORM_DATASET_LINEAGE_SURFACE = "transform-dataset-lineage"
 
 # --- Agent-native impact model (AU2-AU7) -----------------------------------
@@ -713,6 +715,7 @@ MATRIX_GAPS: dict[str, dict[str, str]] = {
         "compass-metadata": "ontology-compass-mapping-unavailable",
         "property-column-mapping": "unsupported-property-column-mapping",
         "object-type-consumers": "unsupported-object-type-consumers",
+        "consumer-osdk-impact": "unsupported-consumer-osdk-impact",
     },
     "property": {
         "dataset-orchestration": "dataset-column-lineage-unavailable",
@@ -1597,6 +1600,7 @@ class DependencyGraphService(BaseService):
         relation_kind: str,
         evidence_ids: Iterable[str],
         coverage: str = "verified",
+        attributes: Optional[Mapping[str, Any]] = None,
     ) -> Edge:
         if relation_kind not in RELATION_KINDS:
             raise ValueError(f"unregistered relation kind: {relation_kind}")
@@ -1606,6 +1610,7 @@ class DependencyGraphService(BaseService):
         edge_id = _stable_id("edge", source, target, relation_kind, orientation)
         evidence = tuple(sorted(set(evidence_ids)))
         existing = context.edges.get(edge_id)
+        merged_attributes: dict[str, Any] = {}
         if existing is not None:
             if (
                 existing.traversal_class != traversal_class
@@ -1613,6 +1618,9 @@ class DependencyGraphService(BaseService):
             ):
                 raise ValueError("conflicting intrinsic relation definition")
             evidence = tuple(sorted(set(existing.evidence_ids) | set(evidence)))
+            merged_attributes.update(existing.attributes)
+        if attributes is not None:
+            merged_attributes.update(attributes)
         edge = Edge(
             edge_id,
             source,
@@ -1622,6 +1630,7 @@ class DependencyGraphService(BaseService):
             orientation,
             evidence,
             coverage,
+            merged_attributes,
         )
         context.edges[edge_id] = edge
         return edge
@@ -1746,7 +1755,11 @@ class DependencyGraphService(BaseService):
         assert target.node_id is not None
         surfaces: tuple[str, ...] = STATIC_SURFACES
         if target.kind == "object-type":
-            surfaces = (*surfaces, OBJECT_TYPE_CONSUMER_SURFACE)
+            surfaces = (
+                *surfaces,
+                OBJECT_TYPE_CONSUMER_SURFACE,
+                CONSUMER_OSDK_IMPACT_SURFACE,
+            )
         if target.kind == "dataset":
             surfaces = (
                 *(
@@ -1774,6 +1787,12 @@ class DependencyGraphService(BaseService):
                 self._graphql_client is not None
                 and target.kind == "object-type"
                 and surface == "object-type-consumers"
+            ):
+                reason = None
+            if (
+                self._conjure_provider is not None
+                and target.kind == "object-type"
+                and surface == CONSUMER_OSDK_IMPACT_SURFACE
             ):
                 reason = None
             if (
@@ -1969,7 +1988,8 @@ class DependencyGraphService(BaseService):
                 application,
             )
             evidence.append(application_evidence.id)
-        self._finish_coverage(record, "covered", evidence_ids=evidence)
+        if not record.complete:
+            self._finish_coverage(record, "covered", evidence_ids=evidence)
 
     def _get_action_index(
         self, context: AnalysisContext, ontology_rid: str
@@ -2244,6 +2264,14 @@ class DependencyGraphService(BaseService):
             self._collect_property_column_mappings(target, context, metadata)
         if target.kind == "object-type":
             self._collect_object_type_consumers(target, context, metadata)
+            object_type_rid = getattr(
+                getattr(metadata, "object_type", None), "rid", None
+            )
+            self._collect_consumer_characterization(
+                context,
+                target,
+                object_type_rid if isinstance(object_type_rid, str) else "",
+            )
         self._collect_reverse_actions(target, context, ontology_rid)
         self._collect_reverse_queries(target, context, ontology_rid)
 
@@ -2573,6 +2601,516 @@ class DependencyGraphService(BaseService):
 
         self._corroborate_object_consumers_with_monocle(
             context, target, metadata, object_type_rid
+        )
+
+    def _collect_consumer_characterization(
+        self,
+        context: AnalysisContext,
+        target: DependencyTarget,
+        object_type_rid: str,
+    ) -> None:
+        """Enrich U6 consumer edges without treating missing OSDK data as safety."""
+
+        if self._conjure_provider is None:
+            return
+        assert target.node_id is not None
+        from .dependency_internal_specs import (
+            ACP_OPERATION_SPECS,
+            CONSUMER_CHARACTERIZATION_OPERATION_SPECS,
+        )
+        from .foundry_internal_client import TokenExpiredError
+
+        osdk_spec = CONSUMER_CHARACTERIZATION_OPERATION_SPECS["ACP-07"]
+        record = self._coverage_record(
+            context,
+            target.kind,
+            CONSUMER_OSDK_IMPACT_SURFACE,
+            target.node_id,
+            operation=osdk_spec.acp_id,
+            transport=osdk_spec.transport,
+            empty_is_inconclusive=True,
+        )
+        app_edges = [
+            edge
+            for edge in context.edges.values()
+            if edge.source == target.node_id
+            and edge.relation_kind == "object-consumed-by-app"
+        ]
+        evidence_ids: list[str] = []
+        inconclusive_reasons: list[str] = []
+        token_expired = False
+        for edge in app_edges:
+            edge_evidence_ids: list[str] = []
+            app = context.nodes[edge.target]
+            app_rid = app.identifiers.get("resource_rid")
+            if not app_rid:
+                inconclusive_reasons.append("application-rid-unavailable")
+                continue
+            osdk_path = osdk_spec.path.format(app_rid=quote(app_rid, safe=""))
+            try:
+                osdk_result = self._invoke_consumer_internal_query(
+                    context,
+                    osdk_spec,
+                    osdk_path,
+                    {"entityRids": [object_type_rid]},
+                    target=target.node_id,
+                )
+            except TokenExpiredError as error:
+                token_expired = True
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    osdk_spec.coverage_surface,
+                    "token-expired",
+                    "token-expired",
+                    str(error),
+                    operation=osdk_spec.acp_id,
+                    locator=osdk_path,
+                )
+                break
+            except BudgetExhausted as error:
+                inconclusive_reasons.append("internal-budget-exhausted")
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    osdk_spec.coverage_surface,
+                    "inconclusive",
+                    "budget-exhausted",
+                    str(error),
+                    retryable=True,
+                    operation=osdk_spec.acp_id,
+                    budget_snapshot=error.snapshot,
+                    locator=osdk_path,
+                )
+                break
+
+            attributes: dict[str, Any] = {}
+            app_detail_spec = replace(
+                osdk_spec,
+                operation="third-party-application.get-internal",
+                verb="GET",
+                path="/third-party-application-service/api/applications/{app_rid}",
+                shape_descriptor={
+                    "required": ("name", "subdomains", "scopes", "listSdks")
+                },
+            )
+            app_path = app_detail_spec.path.format(app_rid=quote(app_rid, safe=""))
+            try:
+                app_result = self._invoke_consumer_internal_query(
+                    context, app_detail_spec, app_path, None, target=app.id
+                )
+            except TokenExpiredError as error:
+                app_result = None
+                token_expired = True
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    osdk_spec.coverage_surface,
+                    "token-expired",
+                    "token-expired",
+                    str(error),
+                    operation=osdk_spec.acp_id,
+                    locator=app_path,
+                )
+            except BudgetExhausted as error:
+                app_result = None
+                inconclusive_reasons.append("internal-budget-exhausted")
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    osdk_spec.coverage_surface,
+                    "inconclusive",
+                    "budget-exhausted",
+                    str(error),
+                    retryable=True,
+                    operation=osdk_spec.acp_id,
+                    budget_snapshot=error.snapshot,
+                    locator=app_path,
+                )
+
+            if (
+                app_result is not None
+                and app_result.coverage_status == "covered"
+                and isinstance(app_result.payload, Mapping)
+            ):
+                app_payload = app_result.payload
+                detail_evidence = self._add_evidence(
+                    context,
+                    app_result.operation_provenance_id,
+                    "application",
+                    "application",
+                    app_payload,
+                )
+                evidence_ids.append(detail_evidence.id)
+                edge_evidence_ids.append(detail_evidence.id)
+                attributes["application"] = {
+                    "name": app_payload.get("name"),
+                    "subdomains": app_payload.get("subdomains"),
+                    "scopes": app_payload.get("scopes"),
+                }
+                list_sdks = app_payload.get("listSdks")
+                if isinstance(list_sdks, list) and not list_sdks:
+                    attributes.update(
+                        {
+                            "osdk_impact": "breaks-live-not-via-stale-bundle",
+                            "breaks_live": True,
+                            "via_stale_bundle": False,
+                        }
+                    )
+            else:
+                inconclusive_reasons.append(
+                    (app_result.error_class if app_result is not None else None)
+                    or "application-detail-unavailable"
+                )
+
+            version_range = (
+                self._osdk_version_range(osdk_result.payload, object_type_rid)
+                if osdk_result.coverage_status == "covered"
+                else None
+            )
+            if version_range is not None:
+                osdk_evidence = self._add_evidence(
+                    context,
+                    osdk_result.operation_provenance_id,
+                    "sdkVersions",
+                    f"sdkVersions.{object_type_rid}",
+                    osdk_result.payload,
+                )
+                evidence_ids.append(osdk_evidence.id)
+                edge_evidence_ids.append(osdk_evidence.id)
+                attributes["osdk_version_range"] = version_range
+            else:
+                inconclusive_reasons.append(
+                    osdk_result.error_class
+                    or f"{osdk_result.result_semantics}-sdk-versions"
+                )
+            self._add_edge(
+                context,
+                edge.source,
+                edge.target,
+                edge.relation_kind,
+                evidence_ids=edge_evidence_ids,
+                coverage=edge.coverage,
+                attributes=attributes,
+            )
+            if token_expired:
+                break
+
+        if not token_expired:
+            consumer_node_ids = {
+                edge.target
+                for edge in context.edges.values()
+                if edge.source == target.node_id
+                and edge.relation_kind
+                in {"object-consumed-by-app", "object-consumed-by-workshop"}
+            }
+            self._name_bare_consumer_rids(
+                context, ACP_OPERATION_SPECS["ACP-08"], consumer_node_ids
+            )
+        if not app_edges:
+            inconclusive_reasons.append("no-app-consumer-edge")
+        if token_expired:
+            self._finish_coverage(
+                record,
+                "token-expired",
+                evidence_ids=evidence_ids,
+                reason="token-expired",
+            )
+        elif inconclusive_reasons:
+            reason = inconclusive_reasons[0]
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason=reason,
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                osdk_spec.coverage_surface,
+                "inconclusive",
+                reason,
+                "ACP-07 could not characterize every application consumer",
+                operation=osdk_spec.acp_id,
+                locator=osdk_spec.path,
+            )
+        else:
+            self._finish_coverage(record, "covered", evidence_ids=evidence_ids)
+
+    @staticmethod
+    def _osdk_version_range(
+        payload: Any, object_type_rid: str
+    ) -> Optional[dict[str, str]]:
+        if not isinstance(payload, Mapping):
+            return None
+        versions = payload.get("sdkVersions")
+        candidate: Any = None
+        if isinstance(versions, Mapping):
+            candidate = versions.get(object_type_rid)
+            if candidate is None and {"oldest", "latest"} <= set(versions):
+                candidate = versions
+        elif isinstance(versions, list):
+            candidate = next(
+                (
+                    item
+                    for item in versions
+                    if isinstance(item, Mapping)
+                    and item.get("entityRid") == object_type_rid
+                ),
+                None,
+            )
+        if not isinstance(candidate, Mapping):
+            return None
+        oldest = candidate.get("oldest")
+        latest = candidate.get("latest")
+        if (
+            not isinstance(oldest, str)
+            or not oldest
+            or not isinstance(latest, str)
+            or not latest
+        ):
+            return None
+        return {"oldest": oldest, "latest": latest}
+
+    def _name_bare_consumer_rids(
+        self,
+        context: AnalysisContext,
+        spec: Any,
+        consumer_node_ids: Iterable[str],
+    ) -> None:
+        from .foundry_internal_client import TokenExpiredError
+
+        for node_id in sorted(set(consumer_node_ids)):
+            node = context.nodes.get(node_id)
+            if node is None:
+                continue
+            rid = node.identifiers.get("resource_rid")
+            if not rid or node.display_name != rid:
+                continue
+            path = spec.path.format(rid=quote(rid, safe=""))
+            record = self._coverage_record(
+                context,
+                node.kind,
+                spec.coverage_surface,
+                node.id,
+                operation=spec.acp_id,
+                transport=spec.transport,
+                empty_is_inconclusive=True,
+            )
+            if record.complete:
+                continue
+            try:
+                result = self._invoke_consumer_internal_query(
+                    context, spec, path, None, target=node.id
+                )
+            except TokenExpiredError as error:
+                self._finish_coverage(record, "token-expired", reason="token-expired")
+                self._add_gap(
+                    context,
+                    node.id,
+                    spec.coverage_surface,
+                    "token-expired",
+                    "token-expired",
+                    str(error),
+                    operation=spec.acp_id,
+                    locator=path,
+                )
+                break
+            except BudgetExhausted as error:
+                self._finish_coverage(record, "inconclusive", reason="budget-exhausted")
+                self._add_gap(
+                    context,
+                    node.id,
+                    spec.coverage_surface,
+                    "inconclusive",
+                    "budget-exhausted",
+                    str(error),
+                    retryable=True,
+                    operation=spec.acp_id,
+                    budget_snapshot=error.snapshot,
+                    locator=path,
+                )
+                continue
+            payload = result.payload
+            name = payload.get("name") if isinstance(payload, Mapping) else None
+            resource_path = (
+                payload.get("path") if isinstance(payload, Mapping) else None
+            )
+            in_trash = (
+                payload.get("inTrash", payload.get("directlyTrashed"))
+                if isinstance(payload, Mapping)
+                else None
+            )
+            returned_rid = payload.get("rid") if isinstance(payload, Mapping) else None
+            if (
+                result.coverage_status == "covered"
+                and returned_rid == rid
+                and isinstance(name, str)
+                and name
+                and isinstance(resource_path, str)
+                and isinstance(in_trash, bool)
+            ):
+                evidence = self._add_evidence(
+                    context,
+                    result.operation_provenance_id,
+                    "resource",
+                    "resource",
+                    payload,
+                )
+                identifiers = dict(node.identifiers)
+                identifiers.update(
+                    {"path": resource_path, "in_trash": str(in_trash).lower()}
+                )
+                context.nodes[node.id] = replace(
+                    node, display_name=name, identifiers=identifiers
+                )
+                self._finish_coverage(record, "covered", evidence_ids=[evidence.id])
+                continue
+            reason = result.error_class or "compass-resource-unresolved"
+            if reason == "token-expired":
+                status = "token-expired"
+            elif reason in {"not-found", "compass-resource-unresolved"}:
+                status = "unresolved"
+            else:
+                status = "inconclusive"
+            self._finish_coverage(record, status, reason=reason)
+            self._add_gap(
+                context,
+                node.id,
+                spec.coverage_surface,
+                status,
+                reason,
+                "ACP-08 could not resolve the consumer RID",
+                operation=spec.acp_id,
+                locator=path,
+            )
+
+    def _invoke_consumer_internal_query(
+        self,
+        context: AnalysisContext,
+        spec: Any,
+        path: str,
+        body: Optional[Mapping[str, Any]],
+        *,
+        target: str,
+    ) -> Any:
+        """Invoke ACP-07/08 reads, including ACP-07's non-mutating PUT body."""
+
+        from .dependency_providers import (
+            ProviderResult,
+            ResultSemantics,
+            classify_conjure_response,
+        )
+
+        provider = self._conjure_provider
+        if provider is None:
+            raise ValueError("internal provider is not configured")
+        internal_client = getattr(provider, "client", None)
+        conjure = getattr(internal_client, "conjure", None)
+        if not callable(conjure):
+            return provider.invoke(
+                context, spec.acp_id, spec.verb, path, body, target=target
+            )
+        timeout = context.internal_budget.request_timeout(
+            context.configured_request_timeout_seconds
+        )
+        context.internal_budget.charge("requests")
+        invoked_at = _utc_now()
+        operation_id = _stable_id(
+            "operation",
+            context.read_context.id,
+            spec.acp_id,
+            len(context.operation_provenance),
+            invoked_at,
+        )
+        response: Any = None
+        try:
+            response = conjure(
+                spec.verb,
+                path,
+                json_body=body,
+                expected=None,
+                request_timeout=timeout,
+            )
+        except Exception as error:
+            if not _is_expected_collection_failure(error):
+                raise
+            classified_error = classify_exception(error)
+            return ProviderResult(
+                None,
+                operation_id,
+                None,
+                "not-run",
+                classified_error.coverage,
+                classified_error.error_class,
+                classified_error.retryable,
+                str(error),
+            )
+        finally:
+            context.operation_provenance[operation_id] = OperationProvenance(
+                operation_id,
+                context.read_context.id,
+                "internal",
+                spec.operation,
+                spec.capability_ids,
+                context.read_context.invocation_sdk_version,
+                invoked_at,
+                _utc_now(),
+                ArgumentObservation("not-applicable"),
+                ArgumentObservation("not-applicable"),
+                timeout,
+                (),
+                transport=spec.transport,
+                acp_id=spec.acp_id,
+                http_verb=spec.verb,
+                path=path,
+                contract_pins=dict(spec.contract_pins),
+            )
+        if not isinstance(response, tuple) or len(response) != 3:
+            return ProviderResult(
+                None,
+                operation_id,
+                None,
+                "not-run",
+                "inconclusive",
+                "response-shape-drift",
+            )
+        status, payload, raw = response
+        if not isinstance(status, int):
+            return ProviderResult(
+                payload,
+                operation_id,
+                "shape-drift",
+                "not-run",
+                "inconclusive",
+                "response-shape-drift",
+                raw=str(raw),
+            )
+        semantics = ResultSemantics(spec, response)
+        classified = classify_conjure_response(status, payload)
+        coverage = classified.coverage
+        error_class = classified.error_class if classified.error_class != "ok" else None
+        if status == 404:
+            coverage = "unresolved"
+            error_class = "not-found"
+        if 200 <= status < 300 and semantics != "ok":
+            coverage = "inconclusive"
+            error_class = (
+                "response-shape-drift"
+                if semantics == "shape-drift"
+                else f"{semantics}-internal-response"
+            )
+        if coverage in {"inaccessible", "unsupported"}:
+            coverage = "inconclusive"
+        return ProviderResult(
+            payload,
+            operation_id,
+            semantics,
+            "not-run",
+            coverage,
+            error_class,
+            classified.retryable,
+            str(raw),
         )
 
     def _emit_object_dependents(
@@ -4717,7 +5255,8 @@ class DependencyGraphService(BaseService):
             for evidence in context.evidence.values()
             if evidence.locator == "resource"
         ]
-        self._finish_coverage(compass, "covered", evidence_ids=resource_evidence)
+        if not compass.complete:
+            self._finish_coverage(compass, "covered", evidence_ids=resource_evidence)
         page_token: Optional[str] = None
         reverse_evidence: list[str] = []
         schedule_work: list[tuple[Node, Mapping[str, CoverageRecord]]] = []

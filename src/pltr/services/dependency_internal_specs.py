@@ -149,6 +149,29 @@ ACP_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
 }
 
 
+CONSUMER_CHARACTERIZATION_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
+    "ACP-07": InternalOperationSpec(
+        acp_id="ACP-07",
+        operation="application-sdk.bulk-get-entity-sdk-versions",
+        capability_ids=("CAP-10",),
+        transport="conjure-rest",
+        verb="PUT",
+        path=(
+            "/third-party-application-service/api/application-sdks/{app_rid}"
+            "/entity-sdk-versions"
+        ),
+        coverage_surface="consumer-osdk-impact",
+        target_kind="object-type",
+        contract_pins=_PINS,
+        shape_descriptor={
+            "required": ("sdkVersions",),
+            "empty_fields": ("sdkVersions",),
+        },
+        positive_control=_config_gated_positive_control,
+    ),
+}
+
+
 GRAPHQL_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
     "ACP-05": InternalOperationSpec(
         acp_id="ACP-05",

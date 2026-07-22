@@ -5,7 +5,8 @@ import json
 import os
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from click.utils import strip_ansi
 import pytest
@@ -13,7 +14,10 @@ from typer.testing import CliRunner
 
 from pltr.cli import app
 from pltr.commands import dependency as dependency_command
-from pltr.services.dependency import DependencyFatalError
+from pltr.services.dependency import (
+    DependencyFatalError,
+    DependencyGraphService as RealDependencyGraphService,
+)
 from pltr.utils.dependency_artifacts import (
     ArtifactWriteError,
     artifact_identity,
@@ -24,6 +28,28 @@ from pltr.utils.formatting import ProtectedOutputCollisionError
 
 
 runner = CliRunner()
+
+
+def _internal_edge_sdk_client() -> SimpleNamespace:
+    metadata = SimpleNamespace(
+        object_type=SimpleNamespace(properties={"email": SimpleNamespace()}),
+        link_types=[],
+        implements_interfaces=[],
+        implements_interfaces2={},
+        shared_property_type_mapping={},
+    )
+    empty_page = SimpleNamespace(data=[], next_page_token=None)
+    return SimpleNamespace(
+        ontologies=SimpleNamespace(
+            Ontology=SimpleNamespace(
+                ObjectType=SimpleNamespace(
+                    get_full_metadata=Mock(return_value=metadata)
+                ),
+                QueryType=SimpleNamespace(list=Mock(return_value=empty_page)),
+            ),
+            ActionTypeFullMetadata=SimpleNamespace(list=Mock(return_value=empty_page)),
+        )
+    )
 
 
 def independent_payload_digest(document):
@@ -239,48 +265,54 @@ def service():
 
 
 @pytest.mark.parametrize(
-    ("arguments", "resolver", "resolver_arguments", "ontology_rid"),
+    ("arguments", "resolver", "resolver_arguments", "ontology_rid", "internal"),
     [
         (
             ["object-type", "ri.ontology", "Employee"],
             "resolve_object_type",
             ("ri.ontology", "Employee"),
             "ri.ontology",
+            True,
         ),
         (
             ["property", "ri.ontology", "Employee", "email"],
             "resolve_property",
             ("ri.ontology", "Employee", "email"),
             "ri.ontology",
+            True,
         ),
         (
             ["link-type", "ri.ontology", "Employee", "manager"],
             "resolve_link_type",
             ("ri.ontology", "Employee", "manager"),
             "ri.ontology",
+            False,
         ),
         (
             ["action-type", "ri.ontology", "promote"],
             "resolve_action_type",
             ("ri.ontology", "promote"),
             "ri.ontology",
+            False,
         ),
         (
             ["query-type", "ri.ontology", "findEmployee"],
             "resolve_query_type",
             ("ri.ontology", "findEmployee"),
             "ri.ontology",
+            False,
         ),
         (
             ["resource", "ri.foundry.main.dataset.abc"],
             "resolve_resource",
             ("ri.foundry.main.dataset.abc",),
             None,
+            False,
         ),
     ],
 )
 def test_each_command_resolves_and_analyzes_once(
-    tmp_path, service, arguments, resolver, resolver_arguments, ontology_rid
+    tmp_path, service, arguments, resolver, resolver_arguments, ontology_rid, internal
 ):
     constructor, instance, context, target = service
     graph_path = tmp_path / f"{resolver}.json"
@@ -314,7 +346,14 @@ def test_each_command_resolves_and_analyzes_once(
         ],
     )
     assert result.exit_code == 0, result.output
-    constructor.assert_called_once_with(profile="qa")
+    constructor.assert_called_once()
+    constructor_kwargs = constructor.call_args.kwargs
+    assert constructor_kwargs["profile"] == "qa"
+    if internal:
+        provider = constructor_kwargs["conjure_provider"]
+        assert provider.client.profile == "qa"
+    else:
+        assert "conjure_provider" not in constructor_kwargs
     create_kwargs = instance.create_context.call_args.kwargs
     assert create_kwargs["host"] == "https://qa.example.com"
     assert create_kwargs["ontology_rid"] == ontology_rid
@@ -1160,6 +1199,225 @@ def test_partial_gap_exits_zero_and_table_references_complete_artifact(
     assert "Employee <- Query q" in result.output
     assert "output" in result.output
     assert "client.ontologies.Ontology.QueryType.list" in result.output
+
+
+def test_no_internal_preserves_sdk_only_graph_and_constructs_no_internal_client(
+    tmp_path, service
+):
+    constructor, instance, _, _ = service
+    expected = analysis_result()
+    instance.analyze.return_value = expected
+    with (
+        patch("pltr.commands.dependency.FoundryInternalClient") as internal_client,
+        patch("pltr.commands.dependency.ConjureRestProvider") as provider,
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "dependency",
+                "property",
+                "ri.ontology",
+                "Employee",
+                "email",
+                "--profile",
+                "qa",
+                "--no-internal",
+                "--format",
+                "json",
+                "--graph-output",
+                str(tmp_path / "graph.json"),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    internal_client.assert_not_called()
+    provider.assert_not_called()
+    constructor.assert_called_once_with(profile="qa")
+    rendered = json.loads(result.output)
+    assert rendered["graph"] == expected["graph"]
+    assert all(
+        operation.get("transport", "sdk") == "sdk"
+        for operation in rendered["operation_provenance"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "reason", "expected"),
+    [
+        (
+            404,
+            {"errorName": "Route:RouteNotMounted"},
+            "route-not-mounted",
+            "inconclusive:route-not-mounted",
+        ),
+        (
+            401,
+            {"errorName": "Default:Unauthorized"},
+            "token-expired",
+            "DEGRADED [token-expired]",
+        ),
+    ],
+)
+def test_mocked_internal_http_degradation_exits_zero_with_sdk_graph(
+    tmp_path, status, payload, reason, expected
+):
+    graph_path = tmp_path / f"{reason}.json"
+    response = Mock(status_code=status, text=json.dumps(payload))
+    response.json.return_value = payload
+
+    def build_service(*, profile, conjure_provider=None):
+        assert profile == "qa"
+        return RealDependencyGraphService(
+            client=_internal_edge_sdk_client(),
+            conjure_provider=conjure_provider,
+        )
+
+    with (
+        patch("pltr.commands.dependency.AuthManager") as auth_constructor,
+        patch(
+            "pltr.commands.dependency.DependencyGraphService",
+            side_effect=build_service,
+        ),
+        patch(
+            "pltr.services.foundry_internal_client.CredentialStorage"
+        ) as credential_storage,
+        patch(
+            "pltr.services.foundry_internal_client.requests.request",
+            return_value=response,
+        ) as request,
+    ):
+        auth_constructor.return_value.storage.get_profile.return_value = {
+            "host": "https://qa.example.com",
+            "token": "command-token",
+        }
+        credential_storage.return_value.get_profile.return_value = {
+            "host": "https://qa.example.com",
+            "token": "request-token",
+        }
+        result = runner.invoke(
+            app,
+            [
+                "dependency",
+                "property",
+                "ri.ontology",
+                "Employee",
+                "email",
+                "--profile",
+                "qa",
+                "--graph-output",
+                str(graph_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert expected in strip_ansi(result.output)
+    request.assert_called_once()
+    artifact = json.loads(graph_path.read_text())
+    assert any(
+        edge["relation_kind"] == "container-member"
+        and edge["target"] == artifact["target"]["node_id"]
+        for edge in artifact["graph"]["edges"]
+    )
+    assert any(gap["reason_code"] == reason for gap in artifact["gaps"])
+
+
+def test_internal_column_edge_renders_in_compact_and_json_with_transport(
+    tmp_path, service
+):
+    _, instance, _, _ = service
+    payload = analysis_result()
+    payload["graph"]["nodes"].append(
+        {
+            "id": "ri.foundry.main.dataset.programs#program_id",
+            "kind": "dataset-column",
+            "display_name": "program_id",
+        }
+    )
+    payload["graph"]["edges"].append(
+        {
+            "id": "edge-column",
+            "source": "ri.foundry.main.dataset.programs#program_id",
+            "target": "object:Employee",
+            "relation_kind": "column-backs-property",
+            "evidence_ids": ["ev-internal"],
+        }
+    )
+    payload["ranked_relationships"] = [
+        {
+            "readable_path": "program_id -> Employee.email",
+            "direction": "downstream",
+            "relation_kind": "column-backs-property",
+            "evidence_summary": {
+                "locator": "datasources[0].definition.propertyMapping.email",
+                "transport": "conjure-rest",
+                "acp_id": "ACP-04",
+            },
+        }
+    ]
+    payload["evidence"].append(
+        {
+            "id": "ev-internal",
+            "operation_provenance_id": "op-internal",
+            "locator": "datasources[0].definition.propertyMapping.email",
+        }
+    )
+    payload["operation_provenance"].append(
+        {
+            "id": "op-internal",
+            "transport": "conjure-rest",
+            "acp_id": "ACP-04",
+            "http_verb": "GET",
+            "path": "/api/v2/ontologies/ri.ontology/objectTypes/Employee",
+        }
+    )
+    instance.analyze.return_value = payload
+
+    compact = runner.invoke(
+        app,
+        [
+            "dependency",
+            "property",
+            "ri.ontology",
+            "Employee",
+            "email",
+            "--profile",
+            "qa",
+            "--graph-output",
+            str(tmp_path / "compact.json"),
+        ],
+    )
+    assert compact.exit_code == 0, compact.output
+    compact_output = strip_ansi(compact.output)
+    assert "column-backs-property" in compact_output
+    assert "conjure-rest ACP-04" in compact_output
+
+    rendered_json = runner.invoke(
+        app,
+        [
+            "dependency",
+            "property",
+            "ri.ontology",
+            "Employee",
+            "email",
+            "--profile",
+            "qa",
+            "--format",
+            "json",
+            "--graph-output",
+            str(tmp_path / "json.json"),
+        ],
+    )
+    assert rendered_json.exit_code == 0, rendered_json.output
+    document = json.loads(rendered_json.output)
+    assert any(
+        edge.get("relation_kind") == "column-backs-property"
+        for edge in document["graph"]["edges"]
+    )
+    assert any(
+        operation.get("transport") == "conjure-rest"
+        and operation.get("acp_id") == "ACP-04"
+        for operation in document["operation_provenance"]
+    )
 
 
 def test_json_preserves_branchless_operation_provenance(tmp_path, service):

@@ -39,6 +39,7 @@ from pltr.commands import (
     proposal,
     dependency,
     capabilities,
+    notepad,
 )
 from pltr.commands.cp import cp_command
 
@@ -137,6 +138,7 @@ app.add_typer(
     name="capabilities",
     help="Inspect native agent-first Foundry capabilities",
 )
+app.add_typer(notepad.app, name="notepad", help="Read Foundry notepad contents")
 app.add_typer(shell.shell_app, name="shell", help="Interactive shell mode")
 app.add_typer(completion.app, name="completion", help="Manage shell completions")
 app.add_typer(alias.app, name="alias", help="Manage command aliases")

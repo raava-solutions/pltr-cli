@@ -23,6 +23,8 @@ from pltr.services.dependency import (
     IMPACT_CATEGORY_CHANGE_OVERRIDES,
     QUERY_DATA_TYPE_TYPES,
     RELATION_KINDS,
+    STATIC_SURFACES,
+    MATRIX_GAPS,
     RELEASE_RISK_WEIGHT_TABLE_VERSION,
     SDK_OPERATION_SPECS,
     AnalysisContext,
@@ -79,6 +81,132 @@ def test_operation_registry_is_closed_and_capability_backed():
     assert SDK_OPERATION_SPECS["dataset.get-schedules"].preview is False
     assert SDK_OPERATION_SPECS["build.get"].branch is False
     assert SDK_OPERATION_SPECS["build.get"].preview is False
+
+
+def test_phase_a_property_column_graph_model_is_registered():
+    assert RELATION_KINDS["column-backs-property"] == (
+        "dependency-flow",
+        "source_to_target",
+    )
+
+
+def test_property_column_surface_stays_terminal_until_u4_collector_lands():
+    assert "property-column-mapping" in STATIC_SURFACES
+    assert (
+        MATRIX_GAPS["property"]["property-column-mapping"]
+        == "unsupported-property-column-mapping"
+    )
+    assert all(
+        "property-column-mapping" in surfaces for kind, surfaces in MATRIX_GAPS.items()
+    )
+
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    node = service._add_node(
+        analysis, "property", "employeeId", {"property": "employeeId"}, True
+    )
+    target = DependencyTarget("property", node.identifiers, node.display_name, node.id)
+
+    service._initialize_matrix(analysis, target)
+    service._complete_coverage(analysis)
+
+    record = service._coverage_record(
+        analysis, "property", "property-column-mapping", node.id
+    )
+    assert record.status == "unsupported"
+    assert record.reason == "unsupported-property-column-mapping"
+    assert not any(
+        gap.surface == "property-column-mapping"
+        and gap.reason_code == "collector-did-not-report"
+        for gap in analysis.gaps.values()
+    )
+    # Model the other applicable collectors succeeding. The newly registered
+    # U3a surface must not be the reason an otherwise complete property run
+    # loses its clean/CI-eligible status before U4 wires ACP-04.
+    for candidate in analysis.coverage_records.values():
+        if candidate.status == "unresolved":
+            service._finish_coverage(candidate, "covered")
+            service._remove_gaps(
+                analysis,
+                candidate.subject_node_id,
+                candidate.surface,
+                "collector-did-not-report",
+            )
+    classification = service._classify_agent_results(analysis, [])
+    agent = service._build_agent_block(
+        analysis, target, None, None, "absent", [], classification, None
+    )
+    assert classification["verification"]["must_verify_before_merge"] == []
+    assert agent["status"] == "clean"
+
+
+def test_inconclusive_is_terminal_and_matrix_completion_stays_deduplicated():
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    node = service._add_node(
+        analysis, "property", "employeeId", {"property": "employeeId"}
+    )
+    record = service._coverage_record(
+        analysis,
+        "property",
+        "property-column-mapping",
+        node.id,
+        operation="ACP-04",
+        transport="conjure-rest",
+        empty_is_inconclusive=True,
+    )
+    service._finish_coverage(record, "inconclusive", reason="empty-internal-response")
+    service._add_gap(
+        analysis,
+        node.id,
+        "property-column-mapping",
+        "inconclusive",
+        "empty-internal-response",
+        "The internal response could not prove absence.",
+        operation="ACP-04",
+    )
+
+    service._complete_coverage(analysis)
+
+    assert record.complete is True
+    assert record.status == "inconclusive"
+    gaps = [
+        gap
+        for gap in analysis.gaps.values()
+        if gap.target == node.id and gap.surface == "property-column-mapping"
+    ]
+    assert len(gaps) == 1
+
+
+def test_dataset_column_node_and_column_backing_edge_round_trip():
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    column = service._add_node(
+        analysis,
+        "dataset-column",
+        "employee_id",
+        {
+            "dataset_rid": "ri.foundry.main.dataset.test",
+            "column": "employee_id",
+        },
+    )
+    prop = service._add_node(
+        analysis, "property", "employeeId", {"property": "employeeId"}
+    )
+
+    edge = service._add_edge(
+        analysis,
+        column.id,
+        prop.id,
+        "column-backs-property",
+        ["evidence-acp-04"],
+    )
+
+    assert edge.source == column.id
+    assert column.id == "ri.foundry.main.dataset.test#employee_id"
+    assert edge.target == prop.id
+    assert edge.traversal_class == "dependency-flow"
+    assert edge.intrinsic_orientation == "source_to_target"
 
 
 def test_pinned_action_and_query_discriminant_registries_are_exhaustive():
@@ -3403,9 +3531,13 @@ def test_change_ranking_varies_by_relation_and_prefers_verified_coverage():
 
 @pytest.mark.parametrize(
     ("edge_coverage", "expected_confidence"),
-    [("unresolved", "partial"), ("unsupported", "unsupported")],
+    [
+        ("unresolved", "partial"),
+        ("inconclusive", "inconclusive"),
+        ("unsupported", "unsupported"),
+    ],
 )
-def test_ranked_paths_report_three_state_coverage_confidence(
+def test_ranked_paths_render_inconclusive_distinctly_from_partial(
     edge_coverage, expected_confidence
 ):
     service = DependencyGraphService(client=SimpleNamespace())

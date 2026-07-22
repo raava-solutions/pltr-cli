@@ -16,6 +16,7 @@ from importlib.metadata import PackageNotFoundError, version
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+import requests
 from foundry_sdk import FoundryClient
 from foundry_sdk import _errors as sdk_errors
 
@@ -218,6 +219,11 @@ class OperationProvenance:
     preview_argument: ArgumentObservation
     request_timeout_seconds: int
     known_limitations: tuple[dict[str, Any], ...] = ()
+    transport: str = "sdk"
+    acp_id: Optional[str] = None
+    http_verb: Optional[str] = None
+    path: Optional[str] = None
+    contract_pins: Optional[dict[str, str]] = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +302,9 @@ class CoverageRecord:
     evidence_ids: list[str] = field(default_factory=list)
     error_id: Optional[str] = None
     reason: Optional[str] = None
+    operation: Optional[str] = None
+    transport: str = "sdk"
+    empty_is_inconclusive: bool = False
 
     @property
     def id(self) -> str:
@@ -495,6 +504,7 @@ class AnalysisContext:
     gaps: dict[str, CoverageGap] = field(default_factory=dict)
     errors: list[dict[str, Any]] = field(default_factory=list)
     caches: dict[tuple[Any, ...], Any] = field(default_factory=dict)
+    internal_budget: DiscoveryBudget = field(default_factory=DiscoveryBudget)
 
     @classmethod
     def create(
@@ -506,6 +516,7 @@ class AnalysisContext:
         dataset_branch: Optional[str] = None,
         budget: Optional[DiscoveryBudget] = None,
         request_timeout_seconds: float = 30.0,
+        internal_budget: Optional[DiscoveryBudget] = None,
     ) -> "AnalysisContext":
         sdk_version = _sdk_version()
         host_fingerprint = (
@@ -535,7 +546,12 @@ class AnalysisContext:
             requested_branch,
             dataset_branch,
         )
-        return cls(read_context, budget or DiscoveryBudget(), request_timeout_seconds)
+        return cls(
+            read_context,
+            budget or DiscoveryBudget(),
+            request_timeout_seconds,
+            internal_budget=internal_budget or DiscoveryBudget(),
+        )
 
 
 RELATION_KINDS: dict[str, tuple[str, str]] = {
@@ -549,6 +565,7 @@ RELATION_KINDS: dict[str, tuple[str, str]] = {
     "run-submitted-build": ("dependency-flow", "source_to_target"),
     "schedule-run": ("dependency-flow", "source_to_target"),
     "build-produced-output": ("dependency-flow", "source_to_target"),
+    "column-backs-property": ("dependency-flow", "source_to_target"),
     "declared-link": ("adjacent-structural", "declared_source_to_target"),
     "container-member": ("adjacent-structural", "container_to_member"),
     "peer": ("adjacent-structural", "peer_canonical"),
@@ -565,6 +582,7 @@ STATIC_SURFACES = (
     "application-internals",
     "workshop-internals",
     "compass-metadata",
+    "property-column-mapping",
 )
 
 # --- Agent-native impact model (AU2-AU7) -----------------------------------
@@ -604,6 +622,7 @@ IMPACT_CATEGORY_BASE: dict[str, str] = {
     "run-submitted-build": "workflow-break",
     "schedule-run": "workflow-break",
     "build-produced-output": "workflow-break",
+    "column-backs-property": "schema-break",
     "declared-link": "schema-break",
     "container-member": "schema-break",
     "peer": "semantic-break",
@@ -670,30 +689,38 @@ MATRIX_GAPS: dict[str, dict[str, str]] = {
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
         "compass-metadata": "ontology-compass-mapping-unavailable",
+        "property-column-mapping": "unsupported-property-column-mapping",
     },
     "property": {
         "dataset-orchestration": "dataset-column-lineage-unavailable",
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
         "compass-metadata": "ontology-compass-mapping-unavailable",
+        # U3a registers this surface, but U4 owns the ACP-04 collector. Keep
+        # it terminal and non-blocking until that collector lands rather than
+        # promising coverage that no Phase A U2a/U3a code path can complete.
+        "property-column-mapping": "unsupported-property-column-mapping",
     },
     "link-type": {
         "dataset-orchestration": "unsupported-dataset-orchestration",
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
         "compass-metadata": "ontology-compass-mapping-unavailable",
+        "property-column-mapping": "unsupported-property-column-mapping",
     },
     "action-type": {
         "dataset-orchestration": "unsupported-dataset-orchestration",
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
         "compass-metadata": "ontology-compass-mapping-unavailable",
+        "property-column-mapping": "unsupported-property-column-mapping",
     },
     "query-type": {
         "dataset-orchestration": "unsupported-dataset-orchestration",
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
         "compass-metadata": "ontology-compass-mapping-unavailable",
+        "property-column-mapping": "unsupported-property-column-mapping",
     },
     "dataset": {
         "ontology-structure-backing": "ontology-backing-mapping-unavailable",
@@ -701,6 +728,7 @@ MATRIX_GAPS: dict[str, dict[str, str]] = {
         "query-related-function-metadata": "reverse-query-mapping-unavailable",
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
+        "property-column-mapping": "unsupported-property-column-mapping",
     },
     "third-party-application": {
         surface: "unsupported-application-internals"
@@ -746,6 +774,14 @@ def classify_exception(error: BaseException) -> ClassifiedFailure:
         if getattr(candidate, "name", None) == "BranchNotFound":
             return ClassifiedFailure("branch-not-found", "unresolved", False)
         mapping = (
+            (
+                (requests.Timeout,),
+                ClassifiedFailure("timeout", "partial", True),
+            ),
+            (
+                (requests.ConnectionError,),
+                ClassifiedFailure("connection", "partial", True),
+            ),
             (
                 (sdk_errors.UnauthorizedError, sdk_errors.NotAuthenticated),
                 ClassifiedFailure("authentication", "inaccessible", False),
@@ -806,11 +842,15 @@ class DependencyGraphService(BaseService):
     """Resolve targets and compose bounded collectors into one canonical graph."""
 
     def __init__(
-        self, profile: Optional[str] = None, client: Optional[FoundryClient] = None
+        self,
+        profile: Optional[str] = None,
+        client: Optional[FoundryClient] = None,
+        conjure_provider: Optional[Any] = None,
     ):
         super().__init__(profile)
         if client is not None:
             self._client = client
+        self._conjure_provider = conjure_provider
 
     def _get_service(self) -> FoundryClient:
         return self.client
@@ -824,6 +864,7 @@ class DependencyGraphService(BaseService):
         dataset_branch: Optional[str] = None,
         budget: Optional[DiscoveryBudget] = None,
         request_timeout_seconds: float = 30.0,
+        internal_budget: Optional[DiscoveryBudget] = None,
     ) -> AnalysisContext:
         return AnalysisContext.create(
             self.profile or "default",
@@ -833,6 +874,7 @@ class DependencyGraphService(BaseService):
             dataset_branch,
             budget,
             request_timeout_seconds,
+            internal_budget,
         )
 
     def resolve_object_type(
@@ -1330,76 +1372,17 @@ class DependencyGraphService(BaseService):
         fatal: bool = False,
         known_limitations: Sequence[dict[str, Any]] = (),
     ) -> tuple[Any, str]:
-        spec = SDK_OPERATION_SPECS.get(operation)
-        if spec is None:
-            raise ValueError(f"unregistered SDK operation: {operation}")
-        supplied = dict(kwargs)
-        if "branch" in supplied and not spec.branch:
-            raise ValueError(f"{operation} does not accept branch")
-        if "preview" in supplied and not spec.preview:
-            raise ValueError(f"{operation} does not accept preview")
-        timeout = context.budget.request_timeout(
-            context.configured_request_timeout_seconds
-        )
-        context.budget.charge("requests")
-        supplied["request_timeout"] = timeout
-        branch = self._argument_observation(spec.branch, supplied, "branch")
-        preview = self._argument_observation(spec.preview, supplied, "preview")
-        invoked_at = _utc_now()
-        operation_id = _stable_id(
-            "operation",
-            context.read_context.id,
+        from .dependency_providers import SdkProvider
+
+        result = SdkProvider(call).invoke(
+            context,
             operation,
-            len(context.operation_provenance),
-            invoked_at,
+            kwargs,
+            target=target,
+            fatal=fatal,
+            known_limitations=known_limitations,
         )
-        limitations = tuple(dict(value) for value in known_limitations)
-        try:
-            response = call(**supplied)
-        except Exception as error:
-            observed_at = _utc_now()
-            context.operation_provenance[operation_id] = OperationProvenance(
-                operation_id,
-                context.read_context.id,
-                spec.namespace,
-                spec.method,
-                spec.capability_ids,
-                context.read_context.invocation_sdk_version,
-                invoked_at,
-                observed_at,
-                branch,
-                preview,
-                timeout,
-                limitations,
-            )
-            classified = classify_exception(error)
-            if fatal:
-                if not _is_expected_collection_failure(error):
-                    raise
-                raise DependencyFatalError(
-                    classified.error_class,
-                    target,
-                    operation,
-                    str(error),
-                    classified.retryable,
-                    context.read_context.id,
-                ) from error
-            raise
-        context.operation_provenance[operation_id] = OperationProvenance(
-            operation_id,
-            context.read_context.id,
-            spec.namespace,
-            spec.method,
-            spec.capability_ids,
-            context.read_context.invocation_sdk_version,
-            invoked_at,
-            _utc_now(),
-            branch,
-            preview,
-            timeout,
-            limitations,
-        )
-        return response, operation_id
+        return result.payload, result.operation_provenance_id
 
     @staticmethod
     def _argument_observation(
@@ -1512,11 +1495,21 @@ class DependencyGraphService(BaseService):
             str(key): str(value) for key, value in sorted(identifiers.items())
         }
         identity = normalized
-        if "resource_rid" in normalized:
+        if kind == "dataset-column":
+            dataset_rid = normalized.get("dataset_rid")
+            column = normalized.get("column")
+            if not dataset_rid or not column:
+                raise ValueError("dataset-column requires dataset_rid and column")
+            node_id = f"{dataset_rid}#{column}"
+        elif "resource_rid" in normalized:
             identity = {"resource_rid": normalized["resource_rid"]}
-        node_id = _stable_id(
-            "node", kind, *[f"{key}={value}" for key, value in identity.items()]
-        )
+            node_id = _stable_id(
+                "node", kind, *[f"{key}={value}" for key, value in identity.items()]
+            )
+        else:
+            node_id = _stable_id(
+                "node", kind, *[f"{key}={value}" for key, value in identity.items()]
+            )
         existing = context.nodes.get(node_id)
         if existing is not None:
             if is_target and not existing.is_target:
@@ -1606,6 +1599,9 @@ class DependencyGraphService(BaseService):
         *,
         parent_record_id: Optional[str] = None,
         applicability_evidence_id: Optional[str] = None,
+        operation: Optional[str] = None,
+        transport: str = "sdk",
+        empty_is_inconclusive: bool = False,
     ) -> CoverageRecord:
         record = CoverageRecord(
             target_kind,
@@ -1614,9 +1610,23 @@ class DependencyGraphService(BaseService):
             context.read_context.id,
             parent_record_id,
             applicability_evidence_id,
+            operation=operation,
+            transport=transport,
+            empty_is_inconclusive=empty_is_inconclusive,
         )
         existing = context.coverage_records.get(record.id)
         if existing is not None:
+            if operation is not None:
+                if existing.operation not in {None, operation}:
+                    raise ValueError("conflicting coverage operation metadata")
+                existing.operation = operation
+            if transport != "sdk":
+                if existing.transport not in {"sdk", transport}:
+                    raise ValueError("conflicting coverage transport metadata")
+                existing.transport = transport
+            existing.empty_is_inconclusive = (
+                existing.empty_is_inconclusive or empty_is_inconclusive
+            )
             return existing
         context.coverage_records[record.id] = record
         return record
@@ -1634,12 +1644,18 @@ class DependencyGraphService(BaseService):
             "covered",
             "covered-empty",
             "partial",
+            "inconclusive",
+            "token-expired",
             "inaccessible",
             "unsupported",
             "unresolved",
             "budget-exhausted",
         }:
             raise ValueError(f"invalid coverage status: {status}")
+        if status == "covered-empty" and (
+            record.transport != "sdk" or record.empty_is_inconclusive
+        ):
+            raise ValueError("internal coverage cannot be covered-empty")
         record.status = status
         record.attempted = attempted
         record.complete = True
@@ -1694,6 +1710,12 @@ class DependencyGraphService(BaseService):
                 context, target.kind, surface, target.node_id
             )
             reason = MATRIX_GAPS.get(target.kind, {}).get(surface)
+            if (
+                self._conjure_provider is not None
+                and target.kind in {"object-type", "property"}
+                and surface == "property-column-mapping"
+            ):
+                reason = None
             if reason:
                 self._finish_coverage(
                     record,
@@ -2152,8 +2174,222 @@ class DependencyGraphService(BaseService):
                 "covered" if evidence_ids else "covered-empty",
                 evidence_ids=evidence_ids,
             )
+        if target.kind in {"object-type", "property"}:
+            self._collect_property_column_mappings(target, context, metadata)
         self._collect_reverse_actions(target, context, ontology_rid)
         self._collect_reverse_queries(target, context, ontology_rid)
+
+    def _collect_property_column_mappings(
+        self,
+        target: DependencyTarget,
+        context: AnalysisContext,
+        metadata: Any,
+    ) -> None:
+        """Augment SDK ontology structure with ACP-04 physical column edges."""
+
+        if self._conjure_provider is None:
+            return
+        assert target.node_id is not None
+        from .dependency_internal_specs import ACP_OPERATION_SPECS
+        from .foundry_internal_client import TokenExpiredError
+
+        spec = ACP_OPERATION_SPECS["ACP-04"]
+        record = self._coverage_record(
+            context,
+            target.kind,
+            spec.coverage_surface,
+            target.node_id,
+            operation=spec.acp_id,
+            transport=spec.transport,
+            empty_is_inconclusive=spec.empty_is_inconclusive,
+        )
+        path = spec.path.format(
+            ontology=target.identifiers["ontology_rid"],
+            object_type=target.identifiers["object_type"],
+        )
+        cache_key = (
+            spec.acp_id,
+            target.identifiers["ontology_rid"],
+            target.identifiers["object_type"],
+        )
+        try:
+            cached = context.caches.get(cache_key)
+            if isinstance(cached, BaseException):
+                raise cached
+            if cached is None:
+                result = self._conjure_provider.invoke(
+                    context,
+                    spec.acp_id,
+                    spec.verb,
+                    path,
+                    None,
+                    target=target.node_id,
+                )
+                context.caches[cache_key] = result
+            else:
+                result = cached
+        except TokenExpiredError as error:
+            context.caches[cache_key] = error
+            self._finish_coverage(record, "token-expired", reason="token-expired")
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "token-expired",
+                "token-expired",
+                str(error),
+                operation=spec.acp_id,
+                locator=path,
+            )
+            return
+
+        shape_drift_payload = (
+            result.coverage_status == "inconclusive"
+            and result.error_class == "response-shape-drift"
+            and isinstance(result.payload, Mapping)
+        )
+        if result.coverage_status != "covered" and not shape_drift_payload:
+            reason = (
+                result.error_class or f"{result.result_semantics}-internal-response"
+            )
+            self._finish_coverage(record, result.coverage_status, reason=reason)
+            if not self._has_reported_gap(
+                context, target.node_id, spec.coverage_surface
+            ):
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    spec.coverage_surface,
+                    result.coverage_status,
+                    reason,
+                    f"{spec.acp_id} returned {result.result_semantics}; "
+                    "absence could not be proven",
+                    retryable=result.retryable,
+                    operation=spec.acp_id,
+                    locator=path,
+                )
+            return
+
+        payload = result.payload
+        datasources = (
+            payload.get("datasources", []) if isinstance(payload, Mapping) else []
+        )
+        sdk_properties = getattr(
+            getattr(metadata, "object_type", None), "properties", {}
+        )
+        property_names = (
+            (target.identifiers["property"],)
+            if target.kind == "property"
+            else tuple(sorted(str(name) for name in sdk_properties))
+        )
+        evidence_ids: list[str] = []
+        shape_drift_locators: list[str] = []
+        for index, datasource in enumerate(datasources):
+            if not isinstance(datasource, Mapping):
+                continue
+            definition = datasource.get("definition")
+            if (
+                not isinstance(definition, Mapping)
+                or definition.get("type") != "dataset"
+            ):
+                continue
+            dataset_rid = definition.get("datasetRid")
+            property_mapping = definition.get("propertyMapping")
+            base_locator = f"datasources[{index}].definition"
+            if not isinstance(dataset_rid, str) or not dataset_rid:
+                shape_drift_locators.append(f"{base_locator}.datasetRid")
+                continue
+            if not isinstance(property_mapping, Mapping):
+                shape_drift_locators.append(f"{base_locator}.propertyMapping")
+                continue
+            for property_name in property_names:
+                mapping = property_mapping.get(property_name)
+                if mapping is None:
+                    continue
+                locator = f"{base_locator}.propertyMapping.{property_name}"
+                if (
+                    not isinstance(mapping, Mapping)
+                    or mapping.get("type") != "column"
+                    or not isinstance(mapping.get("column"), str)
+                    or not mapping["column"]
+                ):
+                    shape_drift_locators.append(locator)
+                    continue
+                property_node = (
+                    context.nodes[target.node_id]
+                    if target.kind == "property"
+                    else self._add_node(
+                        context,
+                        "property",
+                        f"{target.identifiers['object_type']}.{property_name}",
+                        {
+                            "ontology_rid": target.identifiers["ontology_rid"],
+                            "object_type": target.identifiers["object_type"],
+                            "property": property_name,
+                        },
+                    )
+                )
+                column = str(mapping["column"])
+                column_node = self._add_node(
+                    context,
+                    "dataset-column",
+                    column,
+                    {"dataset_rid": dataset_rid, "column": column},
+                )
+                evidence = self._add_evidence(
+                    context,
+                    result.operation_provenance_id,
+                    locator,
+                    locator,
+                    mapping,
+                    discriminator="column",
+                )
+                evidence_ids.append(evidence.id)
+                self._add_edge(
+                    context,
+                    column_node.id,
+                    property_node.id,
+                    "column-backs-property",
+                    [evidence.id],
+                )
+
+        if shape_drift_locators:
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason="response-shape-drift",
+            )
+            for locator in shape_drift_locators:
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    spec.coverage_surface,
+                    "inconclusive",
+                    "response-shape-drift",
+                    "ACP-04 dataset mapping omitted a required discriminator",
+                    operation=spec.acp_id,
+                    locator=locator,
+                )
+            return
+        if not evidence_ids:
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                reason="property-mapping-not-found",
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "property-mapping-not-found",
+                "ACP-04 returned no physical column mapping for the SDK-resolved property",
+                operation=spec.acp_id,
+                locator="datasources",
+            )
+            return
+        self._finish_coverage(record, "covered", evidence_ids=evidence_ids)
 
     def _collect_object_interface_mappings(
         self,
@@ -4620,6 +4856,7 @@ class DependencyGraphService(BaseService):
         confidence_penalty = {
             "verified": 0,
             "partial": 1,
+            "inconclusive": 2,
             "unresolved": 2,
             "unsupported": 3,
         }
@@ -4670,6 +4907,8 @@ class DependencyGraphService(BaseService):
                     "field_path": evidence.field_path,
                     "sdk_namespace": operation.sdk_namespace,
                     "sdk_method": operation.sdk_method,
+                    "transport": operation.transport,
+                    "acp_id": operation.acp_id,
                 }
             item = dict(path)
             item.update(
@@ -4686,12 +4925,18 @@ class DependencyGraphService(BaseService):
                     "sdk_method": evidence_summary["sdk_method"]
                     if evidence_summary
                     else None,
+                    "transport": evidence_summary["transport"]
+                    if evidence_summary
+                    else None,
+                    "acp_id": evidence_summary["acp_id"] if evidence_summary else None,
                     "change_relevance": change_relevance,
                     "coverage_confidence": (
                         "verified"
                         if coverage_score == 0
                         else "unsupported"
                         if coverage_score == 3
+                        else "inconclusive"
+                        if "inconclusive" in path_coverages
                         else "partial"
                     ),
                 }

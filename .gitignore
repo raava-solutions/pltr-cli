@@ -154,3 +154,8 @@ credentials.json
 # ruff
 .ruff_cache/
 .omx/
+.worktrees
+
+# Local dependency-analysis outputs may contain tenant metadata.
+/artifacts/
+/data/

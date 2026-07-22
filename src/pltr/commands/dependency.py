@@ -19,6 +19,8 @@ from ..services.dependency import (
     DependencyGraphService,
     DiscoveryBudget,
 )
+from ..services.dependency_providers import ConjureRestProvider
+from ..services.foundry_internal_client import FoundryInternalClient
 from ..utils.completion import complete_output_format, complete_profile
 from ..utils.dependency_artifacts import (
     ArtifactWriteError,
@@ -333,6 +335,7 @@ def _run(
     change_type: Optional[str | ChangeType] = None,
     output_mode: str | OutputMode = "graph",
     compare_artifact: Optional[Path] = None,
+    internal_enabled: bool = False,
 ) -> None:
     change_type_value = (
         change_type.value if isinstance(change_type, ChangeType) else change_type
@@ -369,7 +372,11 @@ def _run(
             max_depth=depth,
             time_budget_seconds=time_budget_seconds,
         )
-        service = DependencyGraphService(profile=effective_profile)
+        service_kwargs: dict[str, Any] = {"profile": effective_profile}
+        if internal_enabled:
+            internal_client = FoundryInternalClient(effective_profile)
+            service_kwargs["conjure_provider"] = ConjureRestProvider(internal_client)
+        service = DependencyGraphService(**service_kwargs)
         context = service.create_context(
             host=host,
             ontology_rid=ontology_rid,
@@ -498,6 +505,9 @@ def object_type(
         DEFAULT_TIME_BUDGET_SECONDS, "--time-budget-seconds"
     ),
     full: bool = typer.Option(False, "--full", help="Expand table rendering only"),
+    no_internal: bool = typer.Option(
+        False, "--no-internal", help="Use SDK-only dependency discovery"
+    ),
 ) -> None:
     """Analyze an ontology object type."""
     _run(
@@ -522,6 +532,7 @@ def object_type(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
+        internal_enabled=not no_internal,
     )
 
 
@@ -553,6 +564,9 @@ def property_command(
         DEFAULT_TIME_BUDGET_SECONDS, "--time-budget-seconds"
     ),
     full: bool = typer.Option(False, "--full"),
+    no_internal: bool = typer.Option(
+        False, "--no-internal", help="Use SDK-only dependency discovery"
+    ),
 ) -> None:
     """Analyze one property on an ontology object type."""
     _run(
@@ -577,6 +591,7 @@ def property_command(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
+        internal_enabled=not no_internal,
     )
 
 

@@ -89,6 +89,47 @@ def result_fixture():
     }
 
 
+def test_serialize_dependency_result_preserves_internal_transport_and_inconclusive():
+    result = {
+        "operation_provenance": [
+            {
+                "id": "operation-acp-04",
+                "transport": "conjure-rest",
+                "acp_id": "ACP-04",
+            }
+        ],
+        "coverage": [
+            {
+                "id": "coverage-sdk",
+                "surface": "query-related-function-metadata",
+                "status": "partial",
+            },
+            {
+                "id": "coverage-acp-04",
+                "surface": "property-column-mapping",
+                "status": "inconclusive",
+            },
+        ],
+        "gaps": [
+            {
+                "id": "gap-acp-04",
+                "surface": "property-column-mapping",
+                "coverage": "inconclusive",
+                "reason_code": "response-shape-drift",
+            }
+        ],
+    }
+
+    serialized = serialize_dependency_result(result)
+
+    assert serialized["operation_provenance"][0]["transport"] == "conjure-rest"
+    assert [record["status"] for record in serialized["coverage"]] == [
+        "partial",
+        "inconclusive",
+    ]
+    assert serialized["gaps"][0]["coverage"] == "inconclusive"
+
+
 def independent_payload_digest(document):
     payload = {key: value for key, value in document.items() if key != "artifact"}
     agent = payload.get("agent")

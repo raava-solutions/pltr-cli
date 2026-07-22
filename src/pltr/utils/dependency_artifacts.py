@@ -12,6 +12,21 @@ import tempfile
 from typing import Any, Mapping, Optional
 
 
+SERIALIZED_COVERAGE_STATUSES = frozenset(
+    {
+        "covered",
+        "covered-empty",
+        "partial",
+        "inconclusive",
+        "token-expired",
+        "inaccessible",
+        "unsupported",
+        "unresolved",
+        "budget-exhausted",
+    }
+)
+
+
 class ArtifactWriteError(RuntimeError):
     """Raised when the mandatory dependency artifact cannot be retained."""
 
@@ -51,6 +66,18 @@ def serialize_dependency_result(result: Any) -> dict[str, Any]:
     value = _json_value(result)
     if not isinstance(value, dict):
         raise TypeError("dependency analysis result must serialize to an object")
+    coverage = value.get("coverage", value.get("coverage_records", ()))
+    if isinstance(coverage, list):
+        for record in coverage:
+            status = record.get("status") if isinstance(record, Mapping) else None
+            if status is not None and status not in SERIALIZED_COVERAGE_STATUSES:
+                raise ValueError(f"invalid dependency coverage status: {status}")
+    gaps = value.get("gaps", ())
+    if isinstance(gaps, list):
+        for gap in gaps:
+            status = gap.get("coverage") if isinstance(gap, Mapping) else None
+            if status is not None and status not in SERIALIZED_COVERAGE_STATUSES:
+                raise ValueError(f"invalid dependency gap coverage: {status}")
     return value
 
 

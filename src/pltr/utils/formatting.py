@@ -111,7 +111,7 @@ class OutputFormatter:
         elif format_type in {"json", "csv"}:
             print(rendered, end="")
         else:
-            self.console.print(rendered, markup=False, end="")
+            self.console.print(rendered, markup=False, highlight=False, end="")
         return rendered
 
     @staticmethod
@@ -283,10 +283,15 @@ class OutputFormatter:
                     "sdk_namespace"
                 )
                 method = path.get("sdk_method") or evidence_summary.get("sdk_method")
+                transport = path.get("transport") or evidence_summary.get("transport")
+                acp_id = path.get("acp_id") or evidence_summary.get("acp_id")
+                relation_kind = path.get("relation_kind")
                 suffix = ", ".join(
                     part
                     for part in (
+                        str(relation_kind) if relation_kind else "",
                         f"evidence {locator}" if locator else "",
+                        " ".join(str(value) for value in (transport, acp_id) if value),
                         f"{namespace}.{method}"
                         if namespace and method
                         else namespace or method or "",
@@ -301,16 +306,29 @@ class OutputFormatter:
 
         reasons: Dict[str, int] = {}
         for gap in gaps:
-            reason = (
-                gap.get("reason_code", "unknown")
-                if isinstance(gap, dict)
-                else "unknown"
-            )
+            reason = "unknown"
+            if isinstance(gap, dict):
+                reason = (
+                    f"{gap.get('coverage', 'unknown')}:"
+                    f"{gap.get('reason_code', 'unknown')}"
+                )
             reasons[reason] = reasons.get(reason, 0) + 1
         gap_summary = (
             ", ".join(f"{key}={reasons[key]}" for key in sorted(reasons)) or "none"
         )
         lines.append(f"Coverage gaps ({len(gaps)}): {gap_summary}")
+        if any(
+            isinstance(gap, dict)
+            and (
+                gap.get("coverage") == "token-expired"
+                or gap.get("reason_code") == "token-expired"
+            )
+            for gap in gaps
+        ):
+            lines.append(
+                "DEGRADED [token-expired]: Foundry session token expired; "
+                "re-authenticate before relying on internal dependency coverage"
+            )
         stale_messages = sorted(
             {
                 str(gap.get("message"))
@@ -327,6 +345,7 @@ class OutputFormatter:
                 if isinstance(gap, dict):
                     lines.append(
                         f"  - {gap.get('surface', 'unknown')}: "
+                        f"{gap.get('coverage', 'unknown')}:"
                         f"{gap.get('reason_code', 'unknown')} - {gap.get('message', '')}"
                     )
         used = budget.get("used", {}) if isinstance(budget, dict) else {}

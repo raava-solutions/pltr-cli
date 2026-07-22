@@ -26,3 +26,7 @@ The assessment is read-only. It does not authorize or execute a Foundry mutation
 ## Skill source of truth
 
 `skills/pltr-cli/` is the single canonical skill bundle for all agent clients. Do not create provider-specific copies. Client-specific instruction files may point here for compatibility but must not duplicate these rules.
+
+## Documented knowledge
+
+`docs/solutions/` records verified lessons by category, and `CONCEPTS.md` defines shared project vocabulary. Consult them when the current work touches a documented area or term.

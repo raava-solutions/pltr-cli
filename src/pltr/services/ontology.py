@@ -4,7 +4,9 @@ Ontology service wrappers for Foundry SDK.
 
 from typing import Any, Callable, Dict, List, Optional, Union
 from urllib.parse import quote
+
 import requests
+from foundry_sdk.v2.ontologies.models import ApplyActionRequestOptions
 
 from ..config.settings import Settings
 from ..utils.pagination import PaginationConfig, PaginationResult
@@ -610,7 +612,9 @@ class ActionService(BaseService):
             Action result
         """
         try:
-            result = self.service.Action.apply(ontology_rid, action_type, parameters)
+            result = self.service.Action.apply(
+                ontology_rid, action_type, parameters=parameters
+            )
             return self._format_action_result(result)
         except Exception as e:
             raise RuntimeError(f"Failed to apply action {action_type}: {e}")
@@ -633,7 +637,12 @@ class ActionService(BaseService):
             Validation result
         """
         try:
-            result = self.service.Action.validate(ontology_rid, action_type, parameters)
+            result = self.service.Action.apply(
+                ontology_rid,
+                action_type,
+                parameters=parameters,
+                options=ApplyActionRequestOptions(mode="VALIDATE_ONLY"),
+            )
             return self._format_validation_result(result)
         except Exception as e:
             raise RuntimeError(f"Failed to validate action {action_type}: {e}")
@@ -643,7 +652,7 @@ class ActionService(BaseService):
         ontology_rid: str,
         action_type: str,
         requests: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Apply multiple actions of the same type.
 
@@ -653,35 +662,111 @@ class ActionService(BaseService):
             requests: List of action requests (max 20)
 
         Returns:
-            List of action results
+            Combined batch action result
         """
         try:
             if len(requests) > 20:
                 raise ValueError("Maximum 20 actions can be applied in a batch")
 
             result = self.service.Action.apply_batch(
-                ontology_rid, action_type, requests
+                ontology_rid,
+                action_type,
+                requests=[{"parameters": request} for request in requests],
             )
-            return [self._format_action_result(r) for r in result]
+            return self._format_batch_action_result(result)
         except Exception as e:
             raise RuntimeError(f"Failed to apply batch actions: {e}")
 
     def _format_action_result(self, result: Any) -> Dict[str, Any]:
         """Format action result for consistent output."""
+        validation = getattr(result, "validation", None)
+        edits = getattr(result, "edits", None)
         return {
-            "rid": getattr(result, "rid", None),
-            "status": getattr(result, "status", None),
-            "created_objects": getattr(result, "created_objects", []),
-            "modified_objects": getattr(result, "modified_objects", []),
-            "deleted_objects": getattr(result, "deleted_objects", []),
+            "operation_id": getattr(result, "operation_id", None),
+            "validation_result": (
+                getattr(validation, "result", None) if validation is not None else None
+            ),
+            "edits_type": getattr(edits, "type", None) if edits is not None else None,
+            "added_object_count": (
+                getattr(edits, "added_object_count", None)
+                if edits is not None
+                else None
+            ),
+            "modified_objects_count": (
+                getattr(edits, "modified_objects_count", None)
+                if edits is not None
+                else None
+            ),
+            "deleted_objects_count": (
+                getattr(edits, "deleted_objects_count", None)
+                if edits is not None
+                else None
+            ),
+            "added_links_count": (
+                getattr(edits, "added_links_count", None)
+                if edits is not None
+                else None
+            ),
+            "deleted_links_count": (
+                getattr(edits, "deleted_links_count", None)
+                if edits is not None
+                else None
+            ),
+            "edits": getattr(edits, "edits", None) if edits is not None else None,
         }
 
     def _format_validation_result(self, result: Any) -> Dict[str, Any]:
         """Format validation result for consistent output."""
+        validation = getattr(result, "validation", None)
         return {
-            "valid": getattr(result, "valid", False),
-            "errors": getattr(result, "errors", []),
-            "warnings": getattr(result, "warnings", []),
+            "result": (
+                getattr(validation, "result", None)
+                if validation is not None
+                else None
+            ),
+            "submission_criteria": (
+                getattr(validation, "submission_criteria", [])
+                if validation is not None
+                else []
+            ),
+            "parameters": (
+                getattr(validation, "parameters", {})
+                if validation is not None
+                else {}
+            ),
+        }
+
+    def _format_batch_action_result(self, result: Any) -> Dict[str, Any]:
+        """Format the combined edits returned by a batch action."""
+        edits = getattr(result, "edits", None)
+        return {
+            "edits_type": getattr(edits, "type", None) if edits is not None else None,
+            "added_object_count": (
+                getattr(edits, "added_object_count", None)
+                if edits is not None
+                else None
+            ),
+            "modified_objects_count": (
+                getattr(edits, "modified_objects_count", None)
+                if edits is not None
+                else None
+            ),
+            "deleted_objects_count": (
+                getattr(edits, "deleted_objects_count", None)
+                if edits is not None
+                else None
+            ),
+            "added_links_count": (
+                getattr(edits, "added_links_count", None)
+                if edits is not None
+                else None
+            ),
+            "deleted_links_count": (
+                getattr(edits, "deleted_links_count", None)
+                if edits is not None
+                else None
+            ),
+            "edits": getattr(edits, "edits", None) if edits is not None else None,
         }
 
 

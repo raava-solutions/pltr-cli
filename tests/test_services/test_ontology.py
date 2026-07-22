@@ -156,11 +156,17 @@ def sample_object():
 def sample_action_result():
     """Create sample action result."""
     result = Mock()
-    result.rid = "ri.action.result.123"
-    result.status = "SUCCESS"
-    result.created_objects = []
-    result.modified_objects = ["EMP001"]
-    result.deleted_objects = []
+    result.operation_id = "ri.action.operation.123"
+    result.validation = Mock(result="VALID")
+    result.edits = Mock(
+        type="objectEdits",
+        added_object_count=0,
+        modified_objects_count=1,
+        deleted_objects_count=0,
+        added_links_count=0,
+        deleted_links_count=0,
+        edits=["EMP001"],
+    )
     return result
 
 
@@ -168,9 +174,11 @@ def sample_action_result():
 def sample_validation_result():
     """Create sample validation result."""
     result = Mock()
-    result.valid = True
-    result.errors = []
-    result.warnings = []
+    result.validation = Mock(
+        result="VALID",
+        submission_criteria=[],
+        parameters={},
+    )
     return result
 
 
@@ -620,33 +628,44 @@ def test_apply_action(mock_action_service, sample_action_result):
         "ri.ontology.main.ontology.test", "transfer_employee", params
     )
 
-    assert result["status"] == "SUCCESS"
-    assert "EMP001" in result["modified_objects"]
-    mock_action_class.apply.assert_called_once()
+    assert result["operation_id"] == "ri.action.operation.123"
+    assert result["validation_result"] == "VALID"
+    assert result["modified_objects_count"] == 1
+    mock_action_class.apply.assert_called_once_with(
+        "ri.ontology.main.ontology.test",
+        "transfer_employee",
+        parameters=params,
+    )
 
 
 def test_validate_action(mock_action_service, sample_validation_result):
     """Test validating an action."""
     service, mock_action_class = mock_action_service
-    mock_action_class.validate.return_value = sample_validation_result
+    mock_action_class.apply.return_value = sample_validation_result
 
     params = {"employee_id": "EMP001", "new_department": "Sales"}
     result = service.validate_action(
         "ri.ontology.main.ontology.test", "transfer_employee", params
     )
 
-    assert result["valid"] is True
-    assert len(result["errors"]) == 0
-    mock_action_class.validate.assert_called_once()
+    assert result["result"] == "VALID"
+    assert result["submission_criteria"] == []
+    assert result["parameters"] == {}
+    mock_action_class.apply.assert_called_once()
+    call = mock_action_class.apply.call_args
+    assert call.args == (
+        "ri.ontology.main.ontology.test",
+        "transfer_employee",
+    )
+    assert call.kwargs["parameters"] == params
+    assert call.kwargs["options"].mode == "VALIDATE_ONLY"
 
 
 def test_apply_batch_actions(mock_action_service, sample_action_result):
     """Test applying batch actions."""
     service, mock_action_class = mock_action_service
-    mock_action_class.apply_batch.return_value = [
-        sample_action_result,
-        sample_action_result,
-    ]
+    batch_result = Mock(edits=sample_action_result.edits)
+    mock_action_class.apply_batch.return_value = batch_result
 
     requests = [
         {"employee_id": "EMP001", "new_department": "Sales"},
@@ -656,9 +675,16 @@ def test_apply_batch_actions(mock_action_service, sample_action_result):
         "ri.ontology.main.ontology.test", "transfer_employee", requests
     )
 
-    assert len(result) == 2
-    assert result[0]["status"] == "SUCCESS"
-    mock_action_class.apply_batch.assert_called_once()
+    assert result["modified_objects_count"] == 1
+    assert result["edits"] == ["EMP001"]
+    mock_action_class.apply_batch.assert_called_once_with(
+        "ri.ontology.main.ontology.test",
+        "transfer_employee",
+        requests=[
+            {"parameters": requests[0]},
+            {"parameters": requests[1]},
+        ],
+    )
 
 
 def test_apply_batch_actions_exceeds_limit(mock_action_service):

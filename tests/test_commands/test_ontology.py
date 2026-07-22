@@ -521,11 +521,15 @@ def test_apply_action_command(mock_services):
     """Test apply action command."""
     mock_instance = Mock()
     mock_instance.apply_action.return_value = {
-        "rid": "ri.action.result.123",
-        "status": "SUCCESS",
-        "created_objects": [],
-        "modified_objects": ["EMP001"],
-        "deleted_objects": [],
+        "operation_id": "ri.action.operation.123",
+        "validation_result": "VALID",
+        "edits_type": "objectEdits",
+        "added_object_count": 0,
+        "modified_objects_count": 1,
+        "deleted_objects_count": 0,
+        "added_links_count": 0,
+        "deleted_links_count": 0,
+        "edits": ["EMP001"],
     }
     mock_services["action"].return_value = mock_instance
 
@@ -543,9 +547,9 @@ def test_validate_action_command(mock_services):
     """Test validate action command."""
     mock_instance = Mock()
     mock_instance.validate_action.return_value = {
-        "valid": True,
-        "errors": [],
-        "warnings": [],
+        "result": "VALID",
+        "submission_criteria": [],
+        "parameters": {},
     }
     mock_services["action"].return_value = mock_instance
 
@@ -569,9 +573,9 @@ def test_validate_action_invalid(mock_services):
     """Test validate action with invalid parameters."""
     mock_instance = Mock()
     mock_instance.validate_action.return_value = {
-        "valid": False,
-        "errors": ["Missing required field: employee_id"],
-        "warnings": [],
+        "result": "INVALID",
+        "submission_criteria": ["Missing required field: employee_id"],
+        "parameters": {},
     }
     mock_services["action"].return_value = mock_instance
 

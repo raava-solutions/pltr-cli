@@ -665,7 +665,7 @@ def validate_action(
 
         formatter.format_dict(result, format=format, output=output)
 
-        if result.get("valid"):
+        if result.get("result") == "VALID":
             formatter.print_success("Action parameters are valid")
         else:
             formatter.print_error("Action parameters are invalid")

@@ -523,15 +523,16 @@ class OntologyObjectService(BaseService):
             Dictionary containing count information
         """
         try:
-            count = self.service.OntologyObject.count(
+            response = self.service.OntologyObject.count(
                 ontology_rid,
                 object_type,
                 branch=branch,
+                preview=True,
             )
             return {
                 "ontology_rid": ontology_rid,
                 "object_type": object_type,
-                "count": count,
+                "count": response.count,
                 "branch": branch,
             }
         except Exception as e:
@@ -578,6 +579,9 @@ class OntologyObjectService(BaseService):
 
     def _format_object(self, obj: Any) -> Dict[str, Any]:
         """Format object for consistent output."""
+        if isinstance(obj, dict):
+            return dict(obj)
+
         # Objects may have various properties - extract them dynamically
         result = {}
         if hasattr(obj, "__dict__"):

@@ -140,16 +140,12 @@ def sample_object_type():
 @pytest.fixture
 def sample_object():
     """Create sample ontology object."""
-    obj = Mock(spec=[])  # Add spec to avoid Mock attribute issues
-    obj.employee_id = "EMP001"
-    obj.name = "John Doe"
-    obj.department = "Engineering"
-    obj.__dict__ = {
+    return {
         "employee_id": "EMP001",
         "name": "John Doe",
         "department": "Engineering",
+        "__primaryKey": "EMP001",
     }
-    return obj
 
 
 @pytest.fixture
@@ -462,6 +458,8 @@ def test_list_objects(mock_ontology_object_service, sample_object):
     assert len(result) == 1
     assert result[0]["employee_id"] == "EMP001"
     assert result[0]["name"] == "John Doe"
+    assert result[0]["department"] == "Engineering"
+    assert result[0]["__primaryKey"] == "EMP001"
     mock_ontology_object_class.list.assert_called_once()
 
 
@@ -473,21 +471,12 @@ def test_get_object():
         mock_ontologies = Mock()
         mock_ontology_object_class = Mock()
 
-        # Create a simple mock object with the required attributes
-        mock_obj = type(
-            "MockObject",
-            (),
-            {
-                "employee_id": "EMP001",
-                "name": "John Doe",
-                "department": "Engineering",
-                "__dict__": {
-                    "employee_id": "EMP001",
-                    "name": "John Doe",
-                    "department": "Engineering",
-                },
-            },
-        )()
+        mock_obj = {
+            "employee_id": "EMP001",
+            "name": "John Doe",
+            "department": "Engineering",
+            "__primaryKey": "EMP001",
+        }
 
         mock_ontology_object_class.get.return_value = mock_obj
         mock_ontologies.OntologyObject = mock_ontology_object_class
@@ -502,6 +491,8 @@ def test_get_object():
 
         assert result["employee_id"] == "EMP001"
         assert result["name"] == "John Doe"
+        assert result["department"] == "Engineering"
+        assert result["__primaryKey"] == "EMP001"
         mock_ontology_object_class.get.assert_called_once()
 
 
@@ -541,7 +532,7 @@ def test_list_linked_objects(mock_ontology_object_service, sample_object):
 def test_count_objects(mock_ontology_object_service):
     """Test counting objects."""
     service, mock_ontology_object_class = mock_ontology_object_service
-    mock_ontology_object_class.count.return_value = 42
+    mock_ontology_object_class.count.return_value = Mock(count=42)
 
     result = service.count_objects("ri.ontology.main.ontology.test", "Employee")
 
@@ -550,14 +541,14 @@ def test_count_objects(mock_ontology_object_service):
     assert result["object_type"] == "Employee"
     assert result["branch"] is None
     mock_ontology_object_class.count.assert_called_once_with(
-        "ri.ontology.main.ontology.test", "Employee", branch=None
+        "ri.ontology.main.ontology.test", "Employee", branch=None, preview=True
     )
 
 
 def test_count_objects_with_branch(mock_ontology_object_service):
     """Test counting objects with branch specified."""
     service, mock_ontology_object_class = mock_ontology_object_service
-    mock_ontology_object_class.count.return_value = 24
+    mock_ontology_object_class.count.return_value = Mock(count=24)
 
     result = service.count_objects(
         "ri.ontology.main.ontology.test", "Employee", branch="master"
@@ -566,7 +557,7 @@ def test_count_objects_with_branch(mock_ontology_object_service):
     assert result["count"] == 24
     assert result["branch"] == "master"
     mock_ontology_object_class.count.assert_called_once_with(
-        "ri.ontology.main.ontology.test", "Employee", branch="master"
+        "ri.ontology.main.ontology.test", "Employee", branch="master", preview=True
     )
 
 

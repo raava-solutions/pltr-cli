@@ -35,9 +35,12 @@ from pltr.services.dependency import (
     DependencyTarget,
     DiscoveryBudget,
     METADATA_WALK_MAX_DEPTH,
+    OBJECT_TYPE_CONSUMER_SURFACE,
+    OperationProvenance,
     classify_exception,
 )
 from pltr.services.orchestration import OrchestrationService
+from pltr.utils.dependency_artifacts import serialize_dependency_result
 
 
 def context(**budget_values):
@@ -88,6 +91,191 @@ def test_phase_a_property_column_graph_model_is_registered():
         "dependency-flow",
         "source_to_target",
     )
+
+
+@pytest.mark.parametrize(
+    "relation_kind",
+    ["object-consumed-by-app", "object-consumed-by-workshop"],
+)
+def test_object_consumer_relation_kinds_are_provider_to_consumer_dependency_flow(
+    relation_kind,
+):
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    provider = service._add_node(
+        analysis, "object-type", "Employee", {"object_type": "Employee"}
+    )
+    consumer_kind = (
+        "application"
+        if relation_kind == "object-consumed-by-app"
+        else "workshop-module"
+    )
+    consumer = service._add_node(
+        analysis,
+        consumer_kind,
+        "consumer",
+        {"resource_rid": f"ri.test.{consumer_kind}.consumer"},
+    )
+
+    edge = service._add_edge(
+        analysis, provider.id, consumer.id, relation_kind, ["evidence-acp-05"]
+    )
+
+    assert edge.source == provider.id
+    assert edge.target == consumer.id
+    assert edge.traversal_class == "dependency-flow"
+    assert edge.intrinsic_orientation == "source_to_target"
+
+
+def test_declared_link_observations_union_sdk_and_internal_evidence():
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    source = service._add_node(
+        analysis, "object-type", "Employee", {"object_type": "Employee"}
+    )
+    target = service._add_node(
+        analysis, "object-type", "Department", {"object_type": "Department"}
+    )
+
+    first = service._add_edge(
+        analysis, source.id, target.id, "declared-link", ["evidence-sdk"]
+    )
+    second = service._add_edge(
+        analysis, source.id, target.id, "declared-link", ["evidence-acp-05"]
+    )
+
+    assert second.id == first.id
+    assert len(analysis.edges) == 1
+    assert second.evidence_ids == ("evidence-acp-05", "evidence-sdk")
+    assert "object-consumed-by-link" not in RELATION_KINDS
+
+
+def test_object_type_consumer_surface_is_closed_and_terminal_without_provider():
+    assert OBJECT_TYPE_CONSUMER_SURFACE == "object-type-consumers"
+    assert (
+        MATRIX_GAPS["object-type"][OBJECT_TYPE_CONSUMER_SURFACE]
+        == "unsupported-object-type-consumers"
+    )
+    assert all(
+        OBJECT_TYPE_CONSUMER_SURFACE not in surfaces
+        for kind, surfaces in MATRIX_GAPS.items()
+        if kind != "object-type"
+    )
+
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    node = service._add_node(
+        analysis,
+        "object-type",
+        "Employee",
+        {"object_type": "Employee"},
+        True,
+    )
+    target = DependencyTarget(
+        "object-type", node.identifiers, node.display_name, node.id
+    )
+
+    service._initialize_matrix(analysis, target)
+    service._complete_coverage(analysis)
+
+    record = service._coverage_record(
+        analysis, "object-type", "object-type-consumers", node.id
+    )
+    assert record.status == "unsupported"
+    assert record.reason == "unsupported-object-type-consumers"
+
+
+def test_object_type_consumer_surface_accepts_inconclusive_as_terminal_with_gap():
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    node = service._add_node(
+        analysis, "object-type", "Employee", {"object_type": "Employee"}
+    )
+    record = service._coverage_record(
+        analysis,
+        "object-type",
+        "object-type-consumers",
+        node.id,
+        operation="ACP-05",
+        transport="graphql-sse",
+        empty_is_inconclusive=True,
+    )
+    service._finish_coverage(record, "inconclusive", reason="silent-truncation")
+    service._add_gap(
+        analysis,
+        node.id,
+        "object-type-consumers",
+        "inconclusive",
+        "silent-truncation",
+        "Dependents may be truncated.",
+        operation="ACP-05",
+    )
+
+    service._complete_coverage(analysis)
+
+    assert record.complete is True
+    assert record.status == "inconclusive"
+    assert [gap.reason_code for gap in analysis.gaps.values()] == ["silent-truncation"]
+
+
+def test_graphql_operation_provenance_round_trips_acp_pins_and_variables():
+    operation = OperationProvenance(
+        "operation-acp-05",
+        "read-context",
+        "internal",
+        "object-type.get-dependents",
+        ("CAP-10",),
+        "1.101.0",
+        "2026-07-22T00:00:00Z",
+        "2026-07-22T00:00:01Z",
+        ArgumentObservation("not-applicable"),
+        ArgumentObservation("not-applicable"),
+        29,
+        transport="graphql-sse",
+        acp_id="ACP-05",
+        http_verb="POST",
+        path="/graphql-gateway/api/bulk",
+        contract_pins={"mcp": "0.397.0", "verified_on": "2026-07-21"},
+        operation_name="GetObjectTypeDependents",
+        document_sha256="abc123",
+        request_variables={"rid": "ri.ontology.main.object-type.employee"},
+    )
+
+    serialized = serialize_dependency_result(
+        {
+            "operation_provenance": [operation],
+            "coverage": [{"status": "inconclusive"}],
+            "gaps": [{"coverage": "inconclusive"}],
+        }
+    )
+
+    assert serialized["operation_provenance"] == [
+        {
+            "id": "operation-acp-05",
+            "read_context_id": "read-context",
+            "sdk_namespace": "internal",
+            "sdk_method": "object-type.get-dependents",
+            "capability_ids": ["CAP-10"],
+            "invocation_sdk_version": "1.101.0",
+            "invoked_at": "2026-07-22T00:00:00Z",
+            "observed_at": "2026-07-22T00:00:01Z",
+            "branch_argument": {"mode": "not-applicable", "value": None},
+            "preview_argument": {"mode": "not-applicable", "value": None},
+            "request_timeout_seconds": 29,
+            "known_limitations": [],
+            "transport": "graphql-sse",
+            "acp_id": "ACP-05",
+            "http_verb": "POST",
+            "path": "/graphql-gateway/api/bulk",
+            "contract_pins": {
+                "mcp": "0.397.0",
+                "verified_on": "2026-07-21",
+            },
+            "operation_name": "GetObjectTypeDependents",
+            "document_sha256": "abc123",
+            "request_variables": {"rid": "ri.ontology.main.object-type.employee"},
+        }
+    ]
 
 
 def test_property_column_surface_stays_terminal_until_u4_collector_lands():

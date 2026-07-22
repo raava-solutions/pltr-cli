@@ -224,6 +224,9 @@ class OperationProvenance:
     http_verb: Optional[str] = None
     path: Optional[str] = None
     contract_pins: Optional[dict[str, str]] = None
+    operation_name: Optional[str] = None
+    document_sha256: Optional[str] = None
+    request_variables: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -566,6 +569,8 @@ RELATION_KINDS: dict[str, tuple[str, str]] = {
     "schedule-run": ("dependency-flow", "source_to_target"),
     "build-produced-output": ("dependency-flow", "source_to_target"),
     "column-backs-property": ("dependency-flow", "source_to_target"),
+    "object-consumed-by-app": ("dependency-flow", "source_to_target"),
+    "object-consumed-by-workshop": ("dependency-flow", "source_to_target"),
     "declared-link": ("adjacent-structural", "declared_source_to_target"),
     "container-member": ("adjacent-structural", "container_to_member"),
     "peer": ("adjacent-structural", "peer_canonical"),
@@ -584,6 +589,8 @@ STATIC_SURFACES = (
     "compass-metadata",
     "property-column-mapping",
 )
+
+OBJECT_TYPE_CONSUMER_SURFACE = "object-type-consumers"
 
 # --- Agent-native impact model (AU2-AU7) -----------------------------------
 
@@ -623,6 +630,8 @@ IMPACT_CATEGORY_BASE: dict[str, str] = {
     "schedule-run": "workflow-break",
     "build-produced-output": "workflow-break",
     "column-backs-property": "schema-break",
+    "object-consumed-by-app": "runtime-break",
+    "object-consumed-by-workshop": "workflow-break",
     "declared-link": "schema-break",
     "container-member": "schema-break",
     "peer": "semantic-break",
@@ -690,6 +699,7 @@ MATRIX_GAPS: dict[str, dict[str, str]] = {
         "workshop-internals": "unsupported-workshop-internals",
         "compass-metadata": "ontology-compass-mapping-unavailable",
         "property-column-mapping": "unsupported-property-column-mapping",
+        "object-type-consumers": "unsupported-object-type-consumers",
     },
     "property": {
         "dataset-orchestration": "dataset-column-lineage-unavailable",
@@ -851,6 +861,18 @@ class DependencyGraphService(BaseService):
         if client is not None:
             self._client = client
         self._conjure_provider = conjure_provider
+        internal_client = getattr(conjure_provider, "client", None)
+        instance_graphql = (
+            vars(internal_client).get("graphql")
+            if internal_client is not None and hasattr(internal_client, "__dict__")
+            else None
+        )
+        class_graphql = getattr(type(internal_client), "graphql", None)
+        self._graphql_client = (
+            internal_client
+            if callable(instance_graphql) or callable(class_graphql)
+            else None
+        )
 
     def _get_service(self) -> FoundryClient:
         return self.client
@@ -1696,6 +1718,8 @@ class DependencyGraphService(BaseService):
     ) -> None:
         assert target.node_id is not None
         surfaces: tuple[str, ...] = STATIC_SURFACES
+        if target.kind == "object-type":
+            surfaces = (*surfaces, OBJECT_TYPE_CONSUMER_SURFACE)
         if target.kind == "dataset":
             surfaces = tuple(
                 surface
@@ -1714,6 +1738,12 @@ class DependencyGraphService(BaseService):
                 self._conjure_provider is not None
                 and target.kind in {"object-type", "property"}
                 and surface == "property-column-mapping"
+            ):
+                reason = None
+            if (
+                self._graphql_client is not None
+                and target.kind == "object-type"
+                and surface == "object-type-consumers"
             ):
                 reason = None
             if reason:
@@ -2176,8 +2206,675 @@ class DependencyGraphService(BaseService):
             )
         if target.kind in {"object-type", "property"}:
             self._collect_property_column_mappings(target, context, metadata)
+        if target.kind == "object-type":
+            self._collect_object_type_consumers(target, context, metadata)
         self._collect_reverse_actions(target, context, ontology_rid)
         self._collect_reverse_queries(target, context, ontology_rid)
+
+    def _collect_object_type_consumers(
+        self,
+        target: DependencyTarget,
+        context: AnalysisContext,
+        metadata: Any,
+    ) -> None:
+        """Collect reverse object-type consumers without treating absence as safety."""
+
+        if self._graphql_client is None:
+            return
+        assert target.node_id is not None
+        from .dependency_internal_specs import (
+            GET_OBJECT_TYPE_DEPENDENTS_QUERY,
+            GRAPHQL_OPERATION_SPECS,
+        )
+        from .foundry_internal_client import TokenExpiredError
+
+        spec = GRAPHQL_OPERATION_SPECS["ACP-05"]
+        assert spec.operation_name is not None
+        assert spec.page_boundary is not None
+        record = self._coverage_record(
+            context,
+            target.kind,
+            spec.coverage_surface,
+            target.node_id,
+            operation=spec.acp_id,
+            transport=spec.transport,
+            empty_is_inconclusive=spec.empty_is_inconclusive,
+        )
+        object_type_rid = getattr(getattr(metadata, "object_type", None), "rid", None)
+        if not isinstance(object_type_rid, str) or not object_type_rid:
+            self._finish_coverage(
+                record, "inconclusive", reason="object-type-rid-unavailable"
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "object-type-rid-unavailable",
+                "ACP-05 requires the SDK-resolved object type RID",
+                operation=spec.acp_id,
+                locator="object_type.rid",
+            )
+            return
+
+        variables = {"rid": object_type_rid}
+        try:
+            timeout = context.internal_budget.request_timeout(
+                context.configured_request_timeout_seconds
+            )
+            context.internal_budget.charge("requests")
+        except BudgetExhausted as error:
+            self._finish_coverage(
+                record, "inconclusive", reason="internal-budget-exhausted"
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "budget-exhausted",
+                str(error),
+                retryable=True,
+                operation=spec.acp_id,
+                budget_snapshot=error.snapshot,
+                locator=spec.path,
+            )
+            return
+        invoked_at = _utc_now()
+        operation_id = _stable_id(
+            "operation",
+            context.read_context.id,
+            spec.acp_id,
+            len(context.operation_provenance),
+            invoked_at,
+        )
+        try:
+            response = self._graphql_client.graphql(
+                spec.operation_name,
+                GET_OBJECT_TYPE_DEPENDENTS_QUERY,
+                variables,
+                request_timeout=timeout,
+            )
+        except TokenExpiredError as error:
+            self._finish_coverage(record, "token-expired", reason="token-expired")
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "token-expired",
+                "token-expired",
+                str(error),
+                operation=spec.acp_id,
+                locator=spec.path,
+            )
+            return
+        except Exception as error:
+            if not _is_expected_collection_failure(error):
+                raise
+            classified = classify_exception(error)
+            self._finish_coverage(record, "inconclusive", reason=classified.error_class)
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                classified.error_class,
+                f"ACP-05 transport failed: {error}",
+                retryable=classified.retryable,
+                operation=spec.acp_id,
+                locator=spec.path,
+            )
+            return
+        finally:
+            context.operation_provenance[operation_id] = OperationProvenance(
+                operation_id,
+                context.read_context.id,
+                "internal",
+                spec.operation,
+                spec.capability_ids,
+                context.read_context.invocation_sdk_version,
+                invoked_at,
+                _utc_now(),
+                ArgumentObservation("not-applicable"),
+                ArgumentObservation("not-applicable"),
+                timeout,
+                (),
+                transport=spec.transport,
+                acp_id=spec.acp_id,
+                http_verb=spec.verb,
+                path=spec.path,
+                contract_pins=dict(spec.contract_pins),
+                operation_name=spec.operation_name,
+                document_sha256=spec.document_sha256,
+                request_variables=variables,
+            )
+
+        if response.errors:
+            messages = [
+                str(error.get("message"))
+                for error in response.errors
+                if error.get("message")
+            ]
+            self._finish_coverage(record, "inconclusive", reason="graphql-errors")
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "graphql-errors",
+                "; ".join(messages) or response.reason or "GraphQL response failed",
+                operation=spec.acp_id,
+                locator="objectTypeV2.dependents",
+            )
+            return
+        if response.status == "inconclusive":
+            reason = response.reason or "graphql-response-inconclusive"
+            self._finish_coverage(record, "inconclusive", reason=reason)
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                reason,
+                "ACP-05 did not return a complete GraphQL response",
+                retryable=True,
+                operation=spec.acp_id,
+                locator="objectTypeV2.dependents",
+            )
+            return
+
+        data = response.data
+        object_type = data.get("objectTypeV2") if isinstance(data, Mapping) else None
+        if object_type is None:
+            self._finish_coverage(record, "inconclusive", reason="not-found")
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "not-found",
+                "ACP-05 returned objectTypeV2: null",
+                operation=spec.acp_id,
+                locator="objectTypeV2",
+            )
+            return
+        returned_rid = (
+            object_type.get("rid") if isinstance(object_type, Mapping) else None
+        )
+        if returned_rid != object_type_rid:
+            self._finish_coverage(record, "inconclusive", reason="response-shape-drift")
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "response-shape-drift",
+                "ACP-05 returned a different object type RID",
+                operation=spec.acp_id,
+                locator="objectTypeV2.rid",
+            )
+            return
+        dependents = (
+            object_type.get("dependents") if isinstance(object_type, Mapping) else None
+        )
+        if not isinstance(dependents, Mapping):
+            values = None
+        else:
+            values = dependents.get("values")
+        if (
+            not isinstance(dependents, Mapping)
+            or not isinstance(values, list)
+            or "nextPageToken" not in dependents
+        ):
+            self._finish_coverage(record, "inconclusive", reason="response-shape-drift")
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "response-shape-drift",
+                "ACP-05 omitted dependents.values or dependents.nextPageToken",
+                operation=spec.acp_id,
+                locator="objectTypeV2.dependents",
+            )
+            return
+
+        try:
+            evidence_ids, unmatched_links, invalid_values = (
+                self._emit_object_dependents(
+                    context,
+                    target,
+                    metadata,
+                    operation_id,
+                    values,
+                )
+            )
+        except BudgetExhausted as error:
+            evidence_ids = [
+                evidence.id
+                for evidence in context.evidence.values()
+                if evidence.operation_provenance_id == operation_id
+            ]
+            budget_reason = (
+                "graph-budget-exhausted"
+                if error.dimension == "nodes"
+                else "internal-budget-exhausted"
+            )
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason=budget_reason,
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "budget-exhausted",
+                str(error),
+                retryable=True,
+                operation=spec.acp_id,
+                budget_snapshot=error.snapshot,
+                locator="objectTypeV2.dependents.values",
+            )
+            return
+        truncated = (
+            dependents.get("nextPageToken") is not None
+            or len(values) == spec.page_boundary
+        )
+        if truncated:
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason="silent-truncation",
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "silent-truncation",
+                "ACP-05 dependents may be silently truncated",
+                operation=spec.acp_id,
+                locator="objectTypeV2.dependents",
+            )
+        elif unmatched_links or invalid_values:
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason="response-shape-drift",
+            )
+            for locator in [*unmatched_links, *invalid_values]:
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    spec.coverage_surface,
+                    "inconclusive",
+                    "response-shape-drift",
+                    "ACP-05 dependent could not be matched to a typed consumer edge",
+                    operation=spec.acp_id,
+                    locator=locator,
+                )
+        elif not values:
+            self._finish_coverage(
+                record, "inconclusive", reason="endpoint-empty-inconclusive"
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                spec.coverage_surface,
+                "inconclusive",
+                "endpoint-empty-inconclusive",
+                "ACP-05 returned no dependents; absence could not be proven",
+                operation=spec.acp_id,
+                locator="objectTypeV2.dependents.values",
+            )
+        else:
+            self._finish_coverage(record, "covered", evidence_ids=evidence_ids)
+
+        self._corroborate_object_consumers_with_monocle(
+            context, target, metadata, object_type_rid
+        )
+
+    def _emit_object_dependents(
+        self,
+        context: AnalysisContext,
+        target: DependencyTarget,
+        metadata: Any,
+        operation_id: str,
+        values: Sequence[Any],
+    ) -> tuple[list[str], list[str], list[str]]:
+        assert target.node_id is not None
+        link_targets = {
+            str(getattr(link, "link_type_rid", "")): str(
+                getattr(link, "object_type_api_name", "")
+            )
+            for link in (getattr(metadata, "link_types", None) or [])
+            if getattr(link, "link_type_rid", None)
+            and getattr(link, "object_type_api_name", None)
+        }
+        evidence_ids: list[str] = []
+        unmatched_links: list[str] = []
+        invalid_values: list[str] = []
+        for index, dependent in enumerate(values):
+            context.internal_budget.charge("items")
+            locator = f"objectTypeV2.dependents.values[{index}]"
+            if not isinstance(dependent, Mapping):
+                invalid_values.append(locator)
+                continue
+            rid = dependent.get("rid")
+            type_metadata = dependent.get("type")
+            type_name = (
+                type_metadata.get("name")
+                if isinstance(type_metadata, Mapping)
+                else None
+            )
+            if not isinstance(rid, str) or not rid or not isinstance(type_name, str):
+                invalid_values.append(locator)
+                continue
+            evidence = self._add_evidence(
+                context,
+                operation_id,
+                locator,
+                locator,
+                dependent,
+                discriminator=type_name,
+            )
+            evidence_ids.append(evidence.id)
+            if type_name == "Module":
+                consumer = self._add_consumer_node(
+                    context, "workshop-module", rid, dependent
+                )
+                self._add_edge(
+                    context,
+                    target.node_id,
+                    consumer.id,
+                    "object-consumed-by-workshop",
+                    [evidence.id],
+                )
+            elif rid.startswith("ri.third-party-applications.main.application."):
+                consumer = self._add_consumer_node(
+                    context, "application", rid, dependent
+                )
+                self._add_edge(
+                    context,
+                    target.node_id,
+                    consumer.id,
+                    "object-consumed-by-app",
+                    [evidence.id],
+                )
+            elif type_name == "Link type":
+                linked_name = link_targets.get(rid)
+                if linked_name is None:
+                    unmatched_links.append(locator)
+                    continue
+                linked_node = self._add_node(
+                    context,
+                    "object-type",
+                    linked_name,
+                    {
+                        "ontology_rid": target.identifiers["ontology_rid"],
+                        "object_type": linked_name,
+                    },
+                )
+                self._add_edge(
+                    context,
+                    target.node_id,
+                    linked_node.id,
+                    "declared-link",
+                    [evidence.id],
+                )
+            else:
+                invalid_values.append(locator)
+        return evidence_ids, unmatched_links, invalid_values
+
+    def _add_consumer_node(
+        self,
+        context: AnalysisContext,
+        kind: str,
+        rid: str,
+        dependent: Mapping[str, Any],
+    ) -> Node:
+        identifiers = {"resource_rid": rid}
+        for source, destination in (
+            ("path", "path"),
+            ("description", "description"),
+            ("projectRid", "project_rid"),
+        ):
+            value = dependent.get(source)
+            if isinstance(value, str):
+                identifiers[destination] = value
+        parent = dependent.get("parent")
+        if isinstance(parent, Mapping):
+            for source, destination in (
+                ("rid", "parent_rid"),
+                ("name", "parent_name"),
+                ("path", "parent_path"),
+            ):
+                value = parent.get(source)
+                if isinstance(value, str):
+                    identifiers[destination] = value
+        display_name = dependent.get("name")
+        return self._add_node(
+            context,
+            kind,
+            display_name if isinstance(display_name, str) and display_name else rid,
+            identifiers,
+        )
+
+    def _corroborate_object_consumers_with_monocle(
+        self,
+        context: AnalysisContext,
+        target: DependencyTarget,
+        metadata: Any,
+        object_type_rid: str,
+    ) -> None:
+        """Merge V3 monocle evidence only onto edges already proven elsewhere."""
+
+        if self._conjure_provider is None:
+            return
+        assert target.node_id is not None
+        from .dependency_internal_specs import CONJURE_POST_OPERATION_SPECS
+
+        spec = CONJURE_POST_OPERATION_SPECS["ACP-06"]
+        branch = context.read_context.requested_branch or "master"
+        body = {
+            "resourceIdentifiers": [object_type_rid],
+            "branch": {
+                "type": "legacyBranch",
+                "legacyBranch": {"branch": branch, "fallbacks": []},
+            },
+            "serviceTypeFilter": [],
+        }
+        try:
+            result = self._invoke_conjure_post(context, spec, body)
+        except BudgetExhausted:
+            return
+        if result is None:
+            return
+        payload, operation_id = result
+        nodes = payload.get("nodes")
+        if not isinstance(nodes, list):
+            return
+        node_by_rid = {
+            node.identifiers.get("resource_rid"): node
+            for node in context.nodes.values()
+            if node.identifiers.get("resource_rid")
+        }
+        existing_by_target = {
+            edge.target: edge
+            for edge in context.edges.values()
+            if edge.source == target.node_id
+            and edge.relation_kind
+            in {
+                "declared-link",
+                "object-consumed-by-app",
+                "object-consumed-by-workshop",
+            }
+        }
+        declared_by_link_rid: dict[str, Edge] = {}
+        for link in getattr(metadata, "link_types", None) or []:
+            link_rid = getattr(link, "link_type_rid", None)
+            linked_name = getattr(link, "object_type_api_name", None)
+            if not isinstance(link_rid, str) or not isinstance(linked_name, str):
+                continue
+            linked_node = next(
+                (
+                    node
+                    for node in context.nodes.values()
+                    if node.kind == "object-type"
+                    and node.identifiers.get("object_type") == linked_name
+                ),
+                None,
+            )
+            if linked_node is None:
+                continue
+            edge = existing_by_target.get(linked_node.id)
+            if edge is not None and edge.relation_kind == "declared-link":
+                declared_by_link_rid[link_rid] = edge
+        for node_index, node_payload in enumerate(nodes):
+            if not isinstance(node_payload, Mapping):
+                continue
+            if node_payload.get("resourceIdentifier") != object_type_rid:
+                continue
+            links = node_payload.get("links")
+            if not isinstance(links, list):
+                continue
+            for link_index, link in enumerate(links):
+                link_rid = self._monocle_link_id(link)
+                existing = (
+                    declared_by_link_rid.get(link_rid) if link_rid is not None else None
+                )
+                if existing is None:
+                    neighbor_rid = self._monocle_neighbor_rid(link)
+                    consumer_node = node_by_rid.get(neighbor_rid)
+                    if consumer_node is None:
+                        continue
+                    existing = existing_by_target.get(consumer_node.id)
+                    if existing is None:
+                        continue
+                locator = f"nodes[{node_index}].links[{link_index}]"
+                evidence = self._add_evidence(
+                    context,
+                    operation_id,
+                    locator,
+                    locator,
+                    link,
+                    discriminator=link.get("type")
+                    if isinstance(link, Mapping)
+                    else None,
+                )
+                self._add_edge(
+                    context,
+                    existing.source,
+                    existing.target,
+                    existing.relation_kind,
+                    [evidence.id],
+                    coverage=existing.coverage,
+                )
+
+    def _invoke_conjure_post(
+        self,
+        context: AnalysisContext,
+        spec: Any,
+        body: Mapping[str, Any],
+    ) -> Optional[tuple[Mapping[str, Any], str]]:
+        """Invoke one registered read-via-POST operation without widening GET-only ACP."""
+
+        from .dependency_providers import ResultSemantics
+        from .foundry_internal_client import TokenExpiredError
+
+        if spec.verb != "POST":
+            raise ValueError(f"{spec.acp_id} is not a POST operation")
+        internal_client = getattr(self._conjure_provider, "client", None)
+        conjure = getattr(internal_client, "conjure", None)
+        if not callable(conjure):
+            return None
+        timeout = context.internal_budget.request_timeout(
+            context.configured_request_timeout_seconds
+        )
+        context.internal_budget.charge("requests")
+        invoked_at = _utc_now()
+        operation_id = _stable_id(
+            "operation",
+            context.read_context.id,
+            spec.acp_id,
+            len(context.operation_provenance),
+            invoked_at,
+        )
+        try:
+            response = conjure(
+                spec.verb,
+                spec.path,
+                json_body=body,
+                expected=None,
+                request_timeout=timeout,
+            )
+        except TokenExpiredError:
+            return None
+        except Exception as error:
+            if not _is_expected_collection_failure(error):
+                raise
+            return None
+        finally:
+            context.operation_provenance[operation_id] = OperationProvenance(
+                operation_id,
+                context.read_context.id,
+                "internal",
+                spec.operation,
+                spec.capability_ids,
+                context.read_context.invocation_sdk_version,
+                invoked_at,
+                _utc_now(),
+                ArgumentObservation("not-applicable"),
+                ArgumentObservation("not-applicable"),
+                timeout,
+                (),
+                transport=spec.transport,
+                acp_id=spec.acp_id,
+                http_verb=spec.verb,
+                path=spec.path,
+                contract_pins=dict(spec.contract_pins),
+            )
+        if not isinstance(response, tuple) or len(response) != 3:
+            return None
+        status, payload, _raw = response
+        if (
+            not isinstance(status, int)
+            or not 200 <= status < 300
+            or ResultSemantics(spec, response) != "ok"
+            or not isinstance(payload, Mapping)
+        ):
+            return None
+        return payload, operation_id
+
+    @staticmethod
+    def _monocle_neighbor_rid(link: Any) -> Optional[str]:
+        if not isinstance(link, Mapping):
+            return None
+        discriminator = link.get("type")
+        payload = link.get(discriminator) if isinstance(discriminator, str) else None
+        if not isinstance(payload, Mapping):
+            return None
+        for rid_field in ("resourceIdentifier", "objectTypeId"):
+            value = payload.get(rid_field)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _monocle_link_id(link: Any) -> Optional[str]:
+        if not isinstance(link, Mapping):
+            return None
+        discriminator = link.get("type")
+        payload = link.get(discriminator) if isinstance(discriminator, str) else None
+        if not isinstance(payload, Mapping):
+            return None
+        value = payload.get("linkId")
+        return value if isinstance(value, str) and value else None
 
     def _collect_property_column_mappings(
         self,

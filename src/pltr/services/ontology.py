@@ -707,9 +707,7 @@ class ActionService(BaseService):
                 else None
             ),
             "added_links_count": (
-                getattr(edits, "added_links_count", None)
-                if edits is not None
-                else None
+                getattr(edits, "added_links_count", None) if edits is not None else None
             ),
             "deleted_links_count": (
                 getattr(edits, "deleted_links_count", None)
@@ -724,9 +722,7 @@ class ActionService(BaseService):
         validation = getattr(result, "validation", None)
         return {
             "result": (
-                getattr(validation, "result", None)
-                if validation is not None
-                else None
+                getattr(validation, "result", None) if validation is not None else None
             ),
             "submission_criteria": (
                 getattr(validation, "submission_criteria", [])
@@ -734,9 +730,7 @@ class ActionService(BaseService):
                 else []
             ),
             "parameters": (
-                getattr(validation, "parameters", {})
-                if validation is not None
-                else {}
+                getattr(validation, "parameters", {}) if validation is not None else {}
             ),
         }
 
@@ -761,9 +755,7 @@ class ActionService(BaseService):
                 else None
             ),
             "added_links_count": (
-                getattr(edits, "added_links_count", None)
-                if edits is not None
-                else None
+                getattr(edits, "added_links_count", None) if edits is not None else None
             ),
             "deleted_links_count": (
                 getattr(edits, "deleted_links_count", None)

@@ -62,7 +62,6 @@ def _readable_frame() -> GraphQLResult:
                     "name": "Example",
                     "lastModifiedAt": "2026-07-22T00:00:00Z",
                     "description": "A test",
-                    "tags": ["test"],
                 },
                 "latestVersion": {
                     "name": "Version 1",

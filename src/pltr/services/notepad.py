@@ -10,10 +10,14 @@ from ..auth.manager import AuthManager
 from .foundry_internal_client import FoundryInternalClient, GraphQLResult
 
 
+# Select ONLY scalar metadata fields. `metadata.tags` and `notepad.permissions`
+# are composites that REQUIRE a subselection; leaf-selecting either makes the
+# gateway return HTTP 200 + a SubselectionRequired ValidationError with no data
+# (a silent false-"unreadable"). Do not re-add `tags` here.
 GET_NOTEPAD_CONTENTS_QUERY = """query GetNotepadContentsQuery($notepadRid: RID!) {
   notepad(rid: $notepadRid) {
     rid
-    metadata { name lastModifiedAt description tags }
+    metadata { name lastModifiedAt description }
     latestVersion { name contents version }
   }
 }"""

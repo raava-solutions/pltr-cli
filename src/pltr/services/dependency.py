@@ -8,6 +8,8 @@ from an empty graph alone.
 
 from __future__ import annotations
 
+import ast
+import base64
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -15,6 +17,7 @@ from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version
 from time import monotonic
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 import requests
 from foundry_sdk import FoundryClient
@@ -308,6 +311,9 @@ class CoverageRecord:
     operation: Optional[str] = None
     transport: str = "sdk"
     empty_is_inconclusive: bool = False
+    reason_code: Optional[str] = None
+    positive_control_status: Optional[str] = None
+    existence_confirmed: Optional[bool] = None
 
     @property
     def id(self) -> str:
@@ -569,6 +575,9 @@ RELATION_KINDS: dict[str, tuple[str, str]] = {
     "schedule-run": ("dependency-flow", "source_to_target"),
     "build-produced-output": ("dependency-flow", "source_to_target"),
     "column-backs-property": ("dependency-flow", "source_to_target"),
+    "transform-builds-dataset": ("dependency-flow", "source_to_target"),
+    "dataset-feeds-transform": ("dependency-flow", "source_to_target"),
+    "code-repo-builds-dataset": ("dependency-flow", "source_to_target"),
     "object-consumed-by-app": ("dependency-flow", "source_to_target"),
     "object-consumed-by-workshop": ("dependency-flow", "source_to_target"),
     "declared-link": ("adjacent-structural", "declared_source_to_target"),
@@ -591,6 +600,7 @@ STATIC_SURFACES = (
 )
 
 OBJECT_TYPE_CONSUMER_SURFACE = "object-type-consumers"
+TRANSFORM_DATASET_LINEAGE_SURFACE = "transform-dataset-lineage"
 
 # --- Agent-native impact model (AU2-AU7) -----------------------------------
 
@@ -630,6 +640,9 @@ IMPACT_CATEGORY_BASE: dict[str, str] = {
     "schedule-run": "workflow-break",
     "build-produced-output": "workflow-break",
     "column-backs-property": "schema-break",
+    "transform-builds-dataset": "workflow-break",
+    "dataset-feeds-transform": "workflow-break",
+    "code-repo-builds-dataset": "workflow-break",
     "object-consumed-by-app": "runtime-break",
     "object-consumed-by-workshop": "workflow-break",
     "declared-link": "schema-break",
@@ -739,6 +752,7 @@ MATRIX_GAPS: dict[str, dict[str, str]] = {
         "application-internals": "unsupported-application-internals",
         "workshop-internals": "unsupported-workshop-internals",
         "property-column-mapping": "unsupported-property-column-mapping",
+        "transform-dataset-lineage": "unsupported-transform-dataset-lineage",
     },
     "third-party-application": {
         surface: "unsupported-application-internals"
@@ -1661,6 +1675,9 @@ class DependencyGraphService(BaseService):
         evidence_ids: Iterable[str] = (),
         reason: Optional[str] = None,
         attempted: bool = True,
+        reason_code: Optional[str] = None,
+        positive_control_status: Optional[str] = None,
+        existence_confirmed: Optional[bool] = None,
     ) -> None:
         if status not in {
             "covered",
@@ -1677,12 +1694,22 @@ class DependencyGraphService(BaseService):
         if status == "covered-empty" and (
             record.transport != "sdk" or record.empty_is_inconclusive
         ):
-            raise ValueError("internal coverage cannot be covered-empty")
+            sanctioned_acp_01_empty = (
+                record.operation == "ACP-01"
+                and reason_code == "authoritative-empty-no-producer"
+                and positive_control_status == "passed"
+                and existence_confirmed is True
+            )
+            if not sanctioned_acp_01_empty:
+                raise ValueError("internal coverage cannot be covered-empty")
         record.status = status
         record.attempted = attempted
         record.complete = True
         record.evidence_ids = sorted(set(record.evidence_ids) | set(evidence_ids))
         record.reason = reason
+        record.reason_code = reason_code
+        record.positive_control_status = positive_control_status
+        record.existence_confirmed = existence_confirmed
 
     def _add_gap(
         self,
@@ -1721,10 +1748,13 @@ class DependencyGraphService(BaseService):
         if target.kind == "object-type":
             surfaces = (*surfaces, OBJECT_TYPE_CONSUMER_SURFACE)
         if target.kind == "dataset":
-            surfaces = tuple(
-                surface
-                for surface in STATIC_SURFACES
-                if surface != "dataset-orchestration"
+            surfaces = (
+                *(
+                    surface
+                    for surface in STATIC_SURFACES
+                    if surface != "dataset-orchestration"
+                ),
+                TRANSFORM_DATASET_LINEAGE_SURFACE,
             )
             self._coverage_record(
                 context, target.kind, "schedule-reverse-index", target.node_id
@@ -1744,6 +1774,12 @@ class DependencyGraphService(BaseService):
                 self._graphql_client is not None
                 and target.kind == "object-type"
                 and surface == "object-type-consumers"
+            ):
+                reason = None
+            if (
+                self._conjure_provider is not None
+                and target.kind == "dataset"
+                and surface == TRANSFORM_DATASET_LINEAGE_SURFACE
             ):
                 reason = None
             if reason:
@@ -2781,10 +2817,12 @@ class DependencyGraphService(BaseService):
         context: AnalysisContext,
         spec: Any,
         body: Mapping[str, Any],
+        *,
+        raise_token_expired: bool = False,
     ) -> Optional[tuple[Mapping[str, Any], str]]:
         """Invoke one registered read-via-POST operation without widening GET-only ACP."""
 
-        from .dependency_providers import ResultSemantics
+        from .dependency_providers import ResultSemantics, classify_conjure_response
         from .foundry_internal_client import TokenExpiredError
 
         if spec.verb != "POST":
@@ -2814,6 +2852,8 @@ class DependencyGraphService(BaseService):
                 request_timeout=timeout,
             )
         except TokenExpiredError:
+            if raise_token_expired:
+                raise
             return None
         except Exception as error:
             if not _is_expected_collection_failure(error):
@@ -2841,7 +2881,13 @@ class DependencyGraphService(BaseService):
             )
         if not isinstance(response, tuple) or len(response) != 3:
             return None
-        status, payload, _raw = response
+        status, payload, raw = response
+        if (
+            raise_token_expired
+            and isinstance(status, int)
+            and classify_conjure_response(status, payload).coverage == "token-expired"
+        ):
+            raise TokenExpiredError(raw)
         if (
             not isinstance(status, int)
             or not 200 <= status < 300
@@ -2850,6 +2896,148 @@ class DependencyGraphService(BaseService):
         ):
             return None
         return payload, operation_id
+
+    def _invoke_transform_lineage_get(
+        self,
+        context: AnalysisContext,
+        spec: Any,
+        path: str,
+        *,
+        target: str,
+    ) -> Any:
+        """Invoke a Phase B GET without widening the Phase A ACP registry."""
+
+        from .dependency_providers import (
+            ProviderResult,
+            ResultSemantics,
+            classify_conjure_response,
+        )
+
+        if spec.verb != "GET":
+            raise ValueError(f"{spec.acp_id} is not a GET operation")
+        provider = self._conjure_provider
+        internal_client = getattr(provider, "client", None)
+        conjure = getattr(internal_client, "conjure", None)
+        if not callable(conjure):
+            if provider is None:
+                raise ValueError("internal provider is not configured")
+            return provider.invoke(
+                context,
+                spec.acp_id,
+                spec.verb,
+                path,
+                None,
+                target=target,
+            )
+
+        timeout = context.internal_budget.request_timeout(
+            context.configured_request_timeout_seconds
+        )
+        context.internal_budget.charge("requests")
+        invoked_at = _utc_now()
+        operation_id = _stable_id(
+            "operation",
+            context.read_context.id,
+            spec.acp_id,
+            len(context.operation_provenance),
+            invoked_at,
+        )
+        try:
+            response = conjure(
+                spec.verb,
+                path,
+                json_body=None,
+                expected=None,
+                request_timeout=timeout,
+            )
+        except Exception as error:
+            if not _is_expected_collection_failure(error):
+                raise
+            transport_failure = classify_exception(error)
+            gap = CoverageGap(
+                spec.coverage_surface,
+                target,
+                transport_failure.coverage,
+                transport_failure.error_class,
+                f"{spec.acp_id} transport failed: {error}",
+                context.read_context.id,
+                transport_failure.retryable,
+                spec.acp_id,
+                None,
+                path,
+            )
+            context.gaps[gap.id] = gap
+            return ProviderResult(
+                None,
+                operation_id,
+                None,
+                "not-run",
+                transport_failure.coverage,
+                transport_failure.error_class,
+                transport_failure.retryable,
+                str(error),
+            )
+        finally:
+            context.operation_provenance[operation_id] = OperationProvenance(
+                operation_id,
+                context.read_context.id,
+                "internal",
+                spec.operation,
+                spec.capability_ids,
+                context.read_context.invocation_sdk_version,
+                invoked_at,
+                _utc_now(),
+                ArgumentObservation("not-applicable"),
+                ArgumentObservation("not-applicable"),
+                timeout,
+                (),
+                transport=spec.transport,
+                acp_id=spec.acp_id,
+                http_verb=spec.verb,
+                path=path,
+                contract_pins=dict(spec.contract_pins),
+            )
+
+        status, payload, raw = response
+        semantics = ResultSemantics(spec, response)
+        classified = classify_conjure_response(status, payload)
+        if 200 <= status < 300:
+            coverage_status = (
+                "inconclusive"
+                if semantics
+                in {"empty", "truncated", "shape-drift", "permission-ambiguous"}
+                else classified.coverage
+            )
+        else:
+            coverage_status = classified.coverage
+        error_class = classified.error_class if classified.error_class != "ok" else None
+        if semantics == "shape-drift" and 200 <= status < 300:
+            error_class = "response-shape-drift"
+        if coverage_status not in {"covered", "token-expired"}:
+            reason_code = error_class or f"{semantics}-internal-response"
+            gap = CoverageGap(
+                spec.coverage_surface,
+                target,
+                coverage_status,
+                reason_code,
+                f"{spec.acp_id} returned {semantics}; absence could not be proven",
+                context.read_context.id,
+                classified.retryable,
+                spec.acp_id,
+                None,
+                path,
+            )
+            context.gaps[gap.id] = gap
+        return ProviderResult(
+            payload,
+            operation_id,
+            semantics,
+            "not-run",
+            coverage_status,
+            error_class,
+            classified.retryable,
+            raw,
+        )
 
     @staticmethod
     def _monocle_neighbor_rid(link: Any) -> Optional[str]:
@@ -4512,6 +4700,8 @@ class DependencyGraphService(BaseService):
     ) -> None:
         assert target.node_id is not None
         dataset_rid = target.identifiers["resource_rid"]
+        if self._conjure_provider is not None:
+            self._collect_transform_dataset_lineage(target, context)
         dataset_service = DatasetService(self.profile)
         dataset_service._client = self.client
         orchestration = OrchestrationService(self.profile)
@@ -4637,6 +4827,1038 @@ class DependencyGraphService(BaseService):
                 orchestration,
                 child_records,
             )
+
+    def _collect_transform_dataset_lineage(
+        self, target: DependencyTarget, context: AnalysisContext
+    ) -> None:
+        """Collect the fail-closed build2/stemma south edge for one dataset."""
+
+        assert target.node_id is not None
+        from .dependency_internal_specs import TRANSFORM_LINEAGE_GET_OPERATION_SPECS
+        from .foundry_internal_client import TokenExpiredError
+
+        spec = TRANSFORM_LINEAGE_GET_OPERATION_SPECS["ACP-01"]
+        provider = self._conjure_provider
+        if provider is None:
+            return
+        record = self._coverage_record(
+            context,
+            "dataset",
+            TRANSFORM_DATASET_LINEAGE_SURFACE,
+            target.node_id,
+            operation=spec.acp_id,
+            transport=spec.transport,
+            empty_is_inconclusive=spec.empty_is_inconclusive,
+        )
+        dataset_rid = target.identifiers["resource_rid"]
+        path = spec.path.format(dataset_rid=quote(dataset_rid, safe=""))
+        try:
+            result = self._invoke_transform_lineage_get(
+                context,
+                spec,
+                path,
+                target=target.node_id,
+            )
+        except TokenExpiredError as error:
+            self._record_lineage_token_expiry(
+                context, target.node_id, spec.acp_id, path, error
+            )
+            return
+        except BudgetExhausted as error:
+            self._finish_coverage(
+                record, "inconclusive", reason="internal-budget-exhausted"
+            )
+            self._add_gap(
+                context,
+                target.node_id,
+                record.surface,
+                "inconclusive",
+                "budget-exhausted",
+                str(error),
+                retryable=True,
+                operation=spec.acp_id,
+                budget_snapshot=error.snapshot,
+                locator=path,
+            )
+            return
+
+        if result.result_semantics == "empty" and result.payload == {}:
+            existence_confirmed = False
+            if result.positive_control_status == "passed":
+                existence_confirmed = self._confirm_dataset_exists(
+                    context, target.node_id, dataset_rid
+                )
+                if record.status == "token-expired":
+                    return
+            if result.positive_control_status == "passed" and existence_confirmed:
+                self._remove_operation_gaps(
+                    context, target.node_id, record.surface, spec.acp_id
+                )
+                self._finish_coverage(
+                    record,
+                    "covered-empty",
+                    reason="authoritative-empty-no-producer",
+                    reason_code="authoritative-empty-no-producer",
+                    positive_control_status="passed",
+                    existence_confirmed=True,
+                )
+                return
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                reason="authoritative-empty-guard-failed",
+                reason_code="authoritative-empty-guard-failed",
+                positive_control_status=result.positive_control_status,
+                existence_confirmed=existence_confirmed,
+            )
+            if not self._has_reported_gap(context, target.node_id, record.surface):
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    record.surface,
+                    "inconclusive",
+                    "authoritative-empty-guard-failed",
+                    "ACP-01 was empty without both same-run safety controls",
+                    operation=spec.acp_id,
+                    locator=path,
+                )
+            return
+
+        if result.coverage_status != "covered":
+            reason = (
+                result.error_class or f"{result.result_semantics}-internal-response"
+            )
+            terminal_status = (
+                "token-expired"
+                if result.coverage_status == "token-expired"
+                else "inconclusive"
+            )
+            self._finish_coverage(record, terminal_status, reason=reason)
+            self._add_gap(
+                context,
+                target.node_id,
+                record.surface,
+                terminal_status,
+                reason,
+                "ACP-01 could not prove transform lineage",
+                retryable=result.retryable,
+                operation=spec.acp_id,
+                locator=path,
+            )
+            return
+        if not isinstance(result.payload, Mapping):
+            self._finish_lineage_gap(
+                context,
+                record,
+                "inconclusive",
+                "response-shape-drift",
+                "ACP-01 did not return a branch-keyed mapping",
+                spec.acp_id,
+                path,
+            )
+            return
+
+        evidence_ids: list[str] = []
+        unresolved = False
+        inconclusive = False
+        token_expired = False
+        jobspec_count = 0
+        branch_jobspecs, branch_shape_gaps = self._branch_jobspecs(result.payload)
+        for locator in branch_shape_gaps:
+            inconclusive = True
+            self._add_gap(
+                context,
+                target.node_id,
+                record.surface,
+                "inconclusive",
+                "response-shape-drift",
+                "ACP-01 branch jobspec shape was not recognized",
+                operation=spec.acp_id,
+                locator=locator,
+            )
+        for branch, job_index, job_spec in branch_jobspecs:
+            jobspec_count += 1
+            base_locator = f"{branch}.jobSpecs[{job_index}]"
+            jobspec_rid = self._first_string(job_spec, "jobSpecRid", "rid")
+            if jobspec_rid is None:
+                unresolved = True
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    record.surface,
+                    "inconclusive",
+                    "response-shape-drift",
+                    "ACP-01 jobspec omitted its RID",
+                    operation=spec.acp_id,
+                    locator=f"{base_locator}.rid",
+                )
+                continue
+            transform = self._add_node(
+                context,
+                "transform-jobspec",
+                jobspec_rid,
+                {"resource_rid": jobspec_rid, "branch": branch},
+            )
+            input_datasets: list[tuple[Node, str]] = []
+            repos: list[tuple[Node, str]] = []
+            outputs: list[tuple[Node, str]] = []
+            for input_index, input_spec in self._mapping_items(
+                job_spec.get("inputSpecs")
+            ):
+                locator = f"{base_locator}.inputSpecs[{input_index}]"
+                if input_spec.get("inputType") == "artifacts":
+                    repo_rid = self._dataset_locator_rid(input_spec, "artifacts")
+                    if repo_rid is None:
+                        unresolved = True
+                        self._add_gap(
+                            context,
+                            target.node_id,
+                            record.surface,
+                            "inconclusive",
+                            "response-shape-drift",
+                            "ACP-01 artifacts input omitted its repository RID",
+                            operation=spec.acp_id,
+                            locator=f"{locator}.datasetLocator.datasetRid",
+                        )
+                        continue
+                    repo = self._add_node(
+                        context,
+                        "code-repo",
+                        repo_rid,
+                        {"resource_rid": repo_rid},
+                    )
+                    repos.append((repo, locator))
+                    continue
+                if input_spec.get("type") != "foundry":
+                    continue
+                input_rid = self._dataset_locator_rid(input_spec, "foundry")
+                if input_rid is None:
+                    inconclusive = True
+                    self._add_gap(
+                        context,
+                        target.node_id,
+                        record.surface,
+                        "inconclusive",
+                        "response-shape-drift",
+                        "ACP-01 foundry input omitted its dataset RID",
+                        operation=spec.acp_id,
+                        locator=f"{locator}.datasetLocator.datasetRid",
+                    )
+                    continue
+                input_datasets.append(
+                    (
+                        self._add_node(
+                            context,
+                            "dataset",
+                            input_rid,
+                            {"resource_rid": input_rid},
+                        ),
+                        locator,
+                    )
+                )
+            for output_index, output_spec in self._mapping_items(
+                job_spec.get("outputSpecs")
+            ):
+                locator = f"{base_locator}.outputSpecs[{output_index}]"
+                if output_spec.get("type") != "foundry":
+                    continue
+                output_rid = self._dataset_locator_rid(output_spec, "foundry")
+                if output_rid is None:
+                    inconclusive = True
+                    self._add_gap(
+                        context,
+                        target.node_id,
+                        record.surface,
+                        "inconclusive",
+                        "response-shape-drift",
+                        "ACP-01 foundry output omitted its dataset RID",
+                        operation=spec.acp_id,
+                        locator=f"{locator}.datasetLocator.datasetRid",
+                    )
+                    continue
+                output_node = (
+                    context.nodes[target.node_id]
+                    if output_rid == dataset_rid
+                    else self._add_node(
+                        context,
+                        "dataset",
+                        output_rid,
+                        {"resource_rid": output_rid},
+                    )
+                )
+                outputs.append((output_node, locator))
+
+            for input_node, locator in input_datasets:
+                evidence = self._add_evidence(
+                    context,
+                    result.operation_provenance_id,
+                    locator,
+                    f"{locator}.datasetLocator.datasetRid",
+                    job_spec,
+                    discriminator="foundry",
+                )
+                evidence_ids.append(evidence.id)
+                self._add_edge(
+                    context,
+                    input_node.id,
+                    transform.id,
+                    "dataset-feeds-transform",
+                    [evidence.id],
+                )
+            for output_node, locator in outputs:
+                evidence = self._add_evidence(
+                    context,
+                    result.operation_provenance_id,
+                    locator,
+                    f"{locator}.datasetLocator.datasetRid",
+                    job_spec,
+                    discriminator="foundry",
+                )
+                evidence_ids.append(evidence.id)
+                self._add_edge(
+                    context,
+                    transform.id,
+                    output_node.id,
+                    "transform-builds-dataset",
+                    [evidence.id],
+                )
+                for repo, repo_locator in repos:
+                    repo_evidence = self._add_evidence(
+                        context,
+                        result.operation_provenance_id,
+                        repo_locator,
+                        f"{repo_locator}.datasetLocator.datasetRid",
+                        job_spec,
+                        discriminator="artifacts",
+                    )
+                    evidence_ids.append(repo_evidence.id)
+                    self._add_edge(
+                        context,
+                        repo.id,
+                        output_node.id,
+                        "code-repo-builds-dataset",
+                        [repo_evidence.id, evidence.id],
+                    )
+            source_path = self._jobspec_source_path(job_spec)
+            if repos and outputs:
+                if source_path is None:
+                    unresolved = True
+                    self._add_gap(
+                        context,
+                        target.node_id,
+                        record.surface,
+                        "unresolved",
+                        "transform-source-unresolved",
+                        "ACP-01 jobspec did not expose a canonical Python source path",
+                        operation=spec.acp_id,
+                        locator=base_locator,
+                    )
+                else:
+                    for repo, _ in repos:
+                        resolved_ids, source_status = self._collect_transform_source(
+                            context,
+                            target,
+                            repo,
+                            source_path,
+                            result.operation_provenance_id,
+                        )
+                        evidence_ids.extend(resolved_ids)
+                        unresolved = unresolved or source_status == "unresolved"
+                        inconclusive = inconclusive or source_status == "inconclusive"
+                        token_expired = (
+                            token_expired or source_status == "token-expired"
+                        )
+
+        if jobspec_count == 0:
+            self._finish_lineage_gap(
+                context,
+                record,
+                "inconclusive",
+                "response-shape-drift",
+                "ACP-01 returned no parseable branch jobspecs",
+                spec.acp_id,
+                path,
+            )
+        elif not evidence_ids:
+            self._finish_lineage_gap(
+                context,
+                record,
+                "inconclusive",
+                "no-supported-lineage",
+                "ACP-01 contained no foundry dataset lineage",
+                spec.acp_id,
+                path,
+            )
+        elif token_expired:
+            self._finish_coverage(
+                record,
+                "token-expired",
+                evidence_ids=evidence_ids,
+                reason="token-expired",
+            )
+        elif inconclusive:
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason="transform-source-inconclusive",
+            )
+        elif unresolved:
+            self._finish_coverage(
+                record,
+                "inconclusive",
+                evidence_ids=evidence_ids,
+                reason="transform-source-unresolved",
+            )
+        else:
+            self._finish_coverage(record, "covered", evidence_ids=evidence_ids)
+
+    def _confirm_dataset_exists(
+        self, context: AnalysisContext, target_node_id: str, dataset_rid: str
+    ) -> bool:
+        from .dependency_internal_specs import ACP_OPERATION_SPECS
+        from .foundry_internal_client import TokenExpiredError
+
+        spec = ACP_OPERATION_SPECS["ACP-08"]
+        provider = self._conjure_provider
+        if provider is None:
+            return False
+        path = spec.path.format(rid=quote(dataset_rid, safe=""))
+        try:
+            result = provider.invoke(
+                context,
+                spec.acp_id,
+                spec.verb,
+                path,
+                None,
+                target=target_node_id,
+            )
+        except TokenExpiredError as error:
+            self._record_lineage_token_expiry(
+                context, target_node_id, spec.acp_id, path, error
+            )
+            return False
+        except Exception as error:
+            if not isinstance(
+                error, BudgetExhausted
+            ) and not _is_expected_collection_failure(error):
+                raise
+            return False
+        return (
+            result.coverage_status == "covered"
+            and isinstance(result.payload, Mapping)
+            and result.payload.get("rid") == dataset_rid
+        )
+
+    def _collect_transform_source(
+        self,
+        context: AnalysisContext,
+        target: DependencyTarget,
+        repo: Node,
+        source_path: str,
+        jobspec_operation_id: str,
+    ) -> tuple[list[str], Optional[str]]:
+        from .dependency_internal_specs import TRANSFORM_LINEAGE_GET_OPERATION_SPECS
+        from .foundry_internal_client import TokenExpiredError
+
+        assert target.node_id is not None
+        spec = TRANSFORM_LINEAGE_GET_OPERATION_SPECS["ACP-03"]
+        provider = self._conjure_provider
+        if provider is None:
+            return [], "inconclusive"
+        repo_rid = repo.identifiers["resource_rid"]
+        encoded_repo_rid = quote(repo_rid, safe="")
+        encoded_path = quote(source_path.lstrip("/"), safe="")
+        contents_path = spec.path.format(repo_rid=encoded_repo_rid, path=encoded_path)
+        blame_path = f"/stemma/api/repos/{encoded_repo_rid}/paths/blame/{encoded_path}"
+        results = []
+        for request_path in (contents_path, blame_path):
+            try:
+                result = self._invoke_transform_lineage_get(
+                    context,
+                    spec,
+                    request_path,
+                    target=target.node_id,
+                )
+            except TokenExpiredError as error:
+                self._record_lineage_token_expiry(
+                    context, target.node_id, spec.acp_id, request_path, error
+                )
+                return [], "token-expired"
+            except Exception as error:
+                if not isinstance(
+                    error, BudgetExhausted
+                ) and not _is_expected_collection_failure(error):
+                    raise
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    TRANSFORM_DATASET_LINEAGE_SURFACE,
+                    "inconclusive",
+                    "transform-source-unresolved",
+                    str(error),
+                    retryable=isinstance(error, BudgetExhausted),
+                    operation=spec.acp_id,
+                    locator=request_path,
+                )
+                return [], "inconclusive"
+            if result.coverage_status != "covered" or not isinstance(
+                result.payload, Mapping
+            ):
+                status = (
+                    "token-expired"
+                    if result.coverage_status == "token-expired"
+                    else "inconclusive"
+                )
+                self._add_gap(
+                    context,
+                    target.node_id,
+                    TRANSFORM_DATASET_LINEAGE_SURFACE,
+                    status,
+                    result.error_class or "transform-source-unresolved",
+                    "ACP-03 could not resolve transform source and blame",
+                    retryable=result.retryable,
+                    operation=spec.acp_id,
+                    locator=request_path,
+                )
+                return [], status
+            results.append(result)
+        contents_result, blame_result = results
+        encoded_contents = contents_result.payload.get("fileContents")
+        blame_rows = blame_result.payload.get("blameRows")
+        if not isinstance(encoded_contents, str) or not isinstance(blame_rows, list):
+            self._add_gap(
+                context,
+                target.node_id,
+                TRANSFORM_DATASET_LINEAGE_SURFACE,
+                "inconclusive",
+                "response-shape-drift",
+                "ACP-03 omitted fileContents or blameRows",
+                operation=spec.acp_id,
+                locator=source_path,
+            )
+            return [], "inconclusive"
+        try:
+            source = base64.b64decode(encoded_contents, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as error:
+            self._add_gap(
+                context,
+                target.node_id,
+                TRANSFORM_DATASET_LINEAGE_SURFACE,
+                "unresolved",
+                "transform-source-unresolved",
+                str(error),
+                operation=spec.acp_id,
+                locator=source_path,
+            )
+            return [], "inconclusive"
+        matches, issues = self._parse_transform_decorators(source)
+        for issue in issues:
+            self._add_gap(
+                context,
+                target.node_id,
+                TRANSFORM_DATASET_LINEAGE_SURFACE,
+                "unresolved",
+                "transform-source-unresolved",
+                issue["message"],
+                operation=spec.acp_id,
+                locator=f"{source_path}:{issue['line']}",
+            )
+        evidence_ids: list[str] = []
+        unresolved = bool(issues)
+        terminal_status: Optional[str] = None
+        for match in matches:
+            for output_path, output_line in match["outputs"]:
+                resolved, resolution_status = self._resolve_compass_path(
+                    context, target.node_id, output_path
+                )
+                if resolved is None:
+                    unresolved = unresolved or resolution_status == "unresolved"
+                    failure_status = resolution_status or "inconclusive"
+                    if failure_status == "token-expired":
+                        terminal_status = "token-expired"
+                    elif terminal_status != "token-expired":
+                        terminal_status = "inconclusive"
+                    self._add_gap(
+                        context,
+                        target.node_id,
+                        TRANSFORM_DATASET_LINEAGE_SURFACE,
+                        failure_status,
+                        "compass-path-unresolved",
+                        "ACP-08 could not resolve the transform output path",
+                        operation="ACP-08",
+                        locator=output_path,
+                    )
+                    continue
+                output_node = (
+                    context.nodes[target.node_id]
+                    if resolved == target.identifiers["resource_rid"]
+                    else self._add_node(
+                        context,
+                        "dataset",
+                        resolved,
+                        {"resource_rid": resolved},
+                    )
+                )
+                span_locator = (
+                    f"{source_path}:{match['start_line']}-{match['end_line']}"
+                )
+                span_evidence = self._add_evidence(
+                    context,
+                    contents_result.operation_provenance_id,
+                    span_locator,
+                    "@transform",
+                    source,
+                    discriminator="transform",
+                )
+                blame_locator = self._blame_locator(blame_rows, output_line)
+                if blame_locator is None:
+                    unresolved = True
+                    self._add_gap(
+                        context,
+                        target.node_id,
+                        TRANSFORM_DATASET_LINEAGE_SURFACE,
+                        "unresolved",
+                        "blame-row-unresolved",
+                        "ACP-03 blame did not cover the Output argument row",
+                        operation=spec.acp_id,
+                        locator=f"{source_path}:{output_line}",
+                    )
+                    continue
+                blame_evidence = self._add_evidence(
+                    context,
+                    blame_result.operation_provenance_id,
+                    blame_locator,
+                    f"blameRows.outputLine[{output_line}]",
+                    blame_rows,
+                )
+                jobspec_evidence = self._add_evidence(
+                    context,
+                    jobspec_operation_id,
+                    source_path,
+                    "sourcePath",
+                    source_path,
+                )
+                evidence_ids.extend(
+                    [span_evidence.id, blame_evidence.id, jobspec_evidence.id]
+                )
+                self._add_edge(
+                    context,
+                    repo.id,
+                    output_node.id,
+                    "code-repo-builds-dataset",
+                    [span_evidence.id, blame_evidence.id, jobspec_evidence.id],
+                )
+        if not matches and not issues:
+            unresolved = True
+            self._add_gap(
+                context,
+                target.node_id,
+                TRANSFORM_DATASET_LINEAGE_SURFACE,
+                "unresolved",
+                "transform-source-unresolved",
+                "No canonical @transform decorator was found",
+                operation=spec.acp_id,
+                locator=source_path,
+            )
+        return evidence_ids, terminal_status or ("unresolved" if unresolved else None)
+
+    def _resolve_compass_path(
+        self, context: AnalysisContext, target_node_id: str, resource_path: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        from .dependency_internal_specs import ACP_OPERATION_SPECS
+        from .foundry_internal_client import TokenExpiredError
+
+        spec = ACP_OPERATION_SPECS["ACP-08"]
+        provider = self._conjure_provider
+        if provider is None:
+            return None, "inconclusive"
+        path = f"/compass/api/resources?path={quote(resource_path, safe='')}"
+        try:
+            result = provider.invoke(
+                context,
+                spec.acp_id,
+                spec.verb,
+                path,
+                None,
+                target=target_node_id,
+            )
+        except TokenExpiredError as error:
+            self._record_lineage_token_expiry(
+                context, target_node_id, spec.acp_id, path, error
+            )
+            return None, "token-expired"
+        except Exception as error:
+            if not isinstance(
+                error, BudgetExhausted
+            ) and not _is_expected_collection_failure(error):
+                raise
+            return None, "inconclusive"
+        if result.coverage_status != "covered" or not isinstance(
+            result.payload, Mapping
+        ):
+            status = (
+                "token-expired"
+                if result.coverage_status == "token-expired"
+                else "inconclusive"
+            )
+            return None, status
+        rid = result.payload.get("rid")
+        if not isinstance(rid, str) or not rid:
+            return None, "inconclusive"
+        return rid, None
+
+    def _record_lineage_token_expiry(
+        self,
+        context: AnalysisContext,
+        target_node_id: str,
+        operation: str,
+        locator: str,
+        error: BaseException,
+    ) -> None:
+        record = self._coverage_record(
+            context,
+            "dataset",
+            TRANSFORM_DATASET_LINEAGE_SURFACE,
+            target_node_id,
+            transport="conjure-rest",
+            empty_is_inconclusive=True,
+        )
+        self._finish_coverage(record, "token-expired", reason="token-expired")
+        self._add_gap(
+            context,
+            target_node_id,
+            TRANSFORM_DATASET_LINEAGE_SURFACE,
+            "token-expired",
+            "token-expired",
+            str(error),
+            operation=operation,
+            locator=locator,
+        )
+
+    def _invoke_build2_walk(
+        self,
+        context: AnalysisContext,
+        target_node_id: str,
+        branch: str,
+        direction: str,
+        body: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        """Deferred ACP-02 helper with its required-map trap enforced locally."""
+
+        from .dependency_internal_specs import CONJURE_POST_OPERATION_SPECS
+        from .foundry_internal_client import TokenExpiredError
+
+        spec = CONJURE_POST_OPERATION_SPECS["ACP-02"]
+        record = self._coverage_record(
+            context,
+            "dataset",
+            spec.coverage_surface,
+            target_node_id,
+            transport=spec.transport,
+            empty_is_inconclusive=True,
+        )
+        if direction not in {"downstream", "upstream", "connecting"}:
+            raise ValueError("invalid build2 walk direction")
+        fallbacks = body.get("branchFallbacks")
+        path = spec.path.format(branch=quote(branch, safe=""), direction=direction)
+        if not isinstance(fallbacks, Mapping) or not isinstance(
+            fallbacks.get("branches"), list
+        ):
+            self._finish_lineage_gap(
+                context,
+                record,
+                "inconclusive",
+                "missing-required-field",
+                "ACP-02 requires branchFallbacks as a map with a branches list",
+                spec.acp_id,
+                path,
+            )
+            return None
+        post_spec = replace(spec, path=path)
+        try:
+            result = self._invoke_conjure_post(
+                context, post_spec, body, raise_token_expired=True
+            )
+        except TokenExpiredError as error:
+            self._record_lineage_token_expiry(
+                context, target_node_id, spec.acp_id, path, error
+            )
+            return None
+        if result is None:
+            self._finish_lineage_gap(
+                context,
+                record,
+                "inconclusive",
+                "internal-response-inconclusive",
+                "ACP-02 did not return an authoritative response",
+                spec.acp_id,
+                path,
+            )
+            return None
+        payload, _operation_id = result
+        if not payload:
+            self._finish_lineage_gap(
+                context,
+                record,
+                "inconclusive",
+                "endpoint-empty-inconclusive",
+                "An empty ACP-02 walk cannot prove absence",
+                spec.acp_id,
+                path,
+            )
+            return None
+        return payload
+
+    @staticmethod
+    def _branch_jobspecs(
+        payload: Mapping[str, Any],
+    ) -> tuple[
+        list[tuple[str, int, Mapping[str, Any]]],
+        list[str],
+    ]:
+        jobspecs: list[tuple[str, int, Mapping[str, Any]]] = []
+        shape_gaps: list[str] = []
+        for branch, branch_value in sorted(
+            payload.items(), key=lambda item: str(item[0])
+        ):
+            branch_locator = f"{branch}.jobSpecs"
+            values: Any = branch_value
+            if isinstance(branch_value, Mapping) and "jobSpecs" in branch_value:
+                values = branch_value["jobSpecs"]
+            if isinstance(values, Mapping):
+                values = [values]
+            if not isinstance(values, list):
+                shape_gaps.append(branch_locator)
+                continue
+            for index, value in enumerate(values):
+                if isinstance(value, Mapping):
+                    jobspecs.append((str(branch), index, value))
+                else:
+                    shape_gaps.append(f"{branch_locator}[{index}]")
+        return jobspecs, shape_gaps
+
+    @staticmethod
+    def _mapping_items(value: Any) -> Iterable[tuple[int, Mapping[str, Any]]]:
+        if not isinstance(value, list):
+            return ()
+        return tuple(
+            (index, item)
+            for index, item in enumerate(value)
+            if isinstance(item, Mapping)
+        )
+
+    @staticmethod
+    def _first_string(value: Mapping[str, Any], *keys: str) -> Optional[str]:
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
+
+    @staticmethod
+    def _dataset_locator_rid(
+        spec: Mapping[str, Any], discriminator: str
+    ) -> Optional[str]:
+        locator = spec.get("datasetLocator")
+        nested = spec.get(discriminator)
+        if not isinstance(locator, Mapping) and isinstance(nested, Mapping):
+            locator = nested.get("datasetLocator")
+        if not isinstance(locator, Mapping):
+            return None
+        rid = locator.get("datasetRid")
+        return rid if isinstance(rid, str) and rid else None
+
+    @staticmethod
+    def _jobspec_source_path(job_spec: Mapping[str, Any]) -> Optional[str]:
+        direct = job_spec.get("sourcePath")
+        if isinstance(direct, str) and direct.endswith(".py"):
+            return direct
+        transform_spec = job_spec.get("transformSpec")
+        if isinstance(transform_spec, Mapping):
+            nested = transform_spec.get("sourcePath")
+            if isinstance(nested, str) and nested.endswith(".py"):
+                return nested
+        return None
+
+    @staticmethod
+    def _parse_transform_decorators(
+        source: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as error:
+            return [], [
+                {
+                    "line": error.lineno or 1,
+                    "message": "Python transform source could not be parsed",
+                }
+            ]
+        canonical = {"transform": False, "Input": False, "Output": False}
+        transform_aliases: set[str] = set()
+        for imported_node in tree.body:
+            if (
+                isinstance(imported_node, ast.ImportFrom)
+                and imported_node.module == "transforms.api"
+            ):
+                for imported in imported_node.names:
+                    if imported.name in canonical and imported.asname is None:
+                        canonical[imported.name] = True
+                    elif imported.name == "transform" and imported.asname is not None:
+                        transform_aliases.add(imported.asname)
+        matches: list[dict[str, Any]] = []
+        issues: list[dict[str, Any]] = []
+        for function_node in ast.walk(tree):
+            if not isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            function_unsupported = False
+            for decorator in function_node.decorator_list:
+                name = None
+                if isinstance(decorator, ast.Call) and isinstance(
+                    decorator.func, ast.Name
+                ):
+                    name = decorator.func.id
+                if name in {
+                    "transform_df",
+                    "incremental",
+                    "transform",
+                    *transform_aliases,
+                } and (name != "transform" or not all(canonical.values())):
+                    issues.append(
+                        {
+                            "line": decorator.lineno,
+                            "message": "Only canonical transforms.api @transform is supported",
+                        }
+                    )
+                    function_unsupported = True
+            if function_unsupported:
+                continue
+            for decorator in function_node.decorator_list:
+                name = None
+                if isinstance(decorator, ast.Call) and isinstance(
+                    decorator.func, ast.Name
+                ):
+                    name = decorator.func.id
+                if name != "transform" or not isinstance(decorator, ast.Call):
+                    continue
+                calls = [
+                    value
+                    for value in [
+                        *decorator.args,
+                        *(kw.value for kw in decorator.keywords),
+                    ]
+                    if isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id in {"Input", "Output"}
+                ]
+                inputs: list[tuple[str, int]] = []
+                outputs: list[tuple[str, int]] = []
+                invalid = False
+                for call in calls:
+                    if (
+                        len(call.args) != 1
+                        or call.keywords
+                        or not isinstance(call.args[0], ast.Constant)
+                        or not isinstance(call.args[0].value, str)
+                    ):
+                        invalid = True
+                        issues.append(
+                            {
+                                "line": call.lineno,
+                                "message": "Input and Output paths must be string literals",
+                            }
+                        )
+                        continue
+                    item = (call.args[0].value, call.args[0].lineno)
+                    call_name = (
+                        call.func.id if isinstance(call.func, ast.Name) else None
+                    )
+                    if call_name == "Input":
+                        inputs.append(item)
+                    else:
+                        outputs.append(item)
+                if (
+                    invalid
+                    or not outputs
+                    or len(outputs) > 1
+                    or len(calls) != len(decorator.args) + len(decorator.keywords)
+                ):
+                    if not invalid:
+                        issues.append(
+                            {
+                                "line": outputs[1][1]
+                                if len(outputs) > 1
+                                else decorator.lineno,
+                                "message": (
+                                    "Only one literal Output is supported"
+                                    if len(outputs) > 1
+                                    else "Transform arguments must be literal Input/Output calls"
+                                ),
+                            }
+                        )
+                    continue
+                matches.append(
+                    {
+                        "inputs": inputs,
+                        "outputs": outputs,
+                        "start_line": decorator.lineno,
+                        "end_line": decorator.end_lineno or decorator.lineno,
+                    }
+                )
+        return matches, issues
+
+    @staticmethod
+    def _blame_locator(blame_rows: Sequence[Any], output_line: int) -> Optional[str]:
+        for index, row in enumerate(blame_rows):
+            if not isinstance(row, Mapping):
+                continue
+            exact = row.get("lineNumber", row.get("rowNumber", row.get("row")))
+            start = row.get("startLine")
+            end = row.get("endLine")
+            if exact == output_line or (
+                isinstance(start, int)
+                and isinstance(end, int)
+                and start <= output_line <= end
+            ):
+                return f"blameRows[{index}]@{output_line}"
+        return None
+
+    def _finish_lineage_gap(
+        self,
+        context: AnalysisContext,
+        record: CoverageRecord,
+        status: str,
+        reason: str,
+        message: str,
+        operation: str,
+        locator: str,
+    ) -> None:
+        self._finish_coverage(record, status, reason=reason)
+        self._add_gap(
+            context,
+            record.subject_node_id,
+            record.surface,
+            status,
+            reason,
+            message,
+            operation=operation,
+            locator=locator,
+        )
+
+    @staticmethod
+    def _remove_operation_gaps(
+        context: AnalysisContext,
+        subject_node_id: str,
+        surface: str,
+        operation: str,
+    ) -> None:
+        for gap_id, gap in list(context.gaps.items()):
+            if (
+                gap.target == subject_node_id
+                and gap.surface == surface
+                and gap.operation == operation
+            ):
+                context.gaps.pop(gap_id, None)
 
     def _collect_schedule(
         self,

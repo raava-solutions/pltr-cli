@@ -36,6 +36,7 @@ from pltr.services.dependency import (
     DiscoveryBudget,
     METADATA_WALK_MAX_DEPTH,
     OBJECT_TYPE_CONSUMER_SURFACE,
+    TRANSFORM_DATASET_LINEAGE_SURFACE,
     OperationProvenance,
     classify_exception,
 )
@@ -91,6 +92,150 @@ def test_phase_a_property_column_graph_model_is_registered():
         "dependency-flow",
         "source_to_target",
     )
+
+
+@pytest.mark.parametrize(
+    ("relation_kind", "source_kind", "target_kind"),
+    [
+        ("transform-builds-dataset", "transform-jobspec", "dataset"),
+        ("dataset-feeds-transform", "dataset", "transform-jobspec"),
+        ("code-repo-builds-dataset", "code-repo", "dataset"),
+    ],
+)
+def test_u5_relation_kinds_round_trip_as_provider_to_consumer_edges(
+    relation_kind, source_kind, target_kind
+):
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    source = service._add_node(
+        analysis, source_kind, "source", {"resource_rid": "ri.source"}
+    )
+    target = service._add_node(
+        analysis, target_kind, "target", {"resource_rid": "ri.target"}
+    )
+
+    edge = service._add_edge(
+        analysis, source.id, target.id, relation_kind, ["evidence-u5"]
+    )
+
+    assert edge.source == source.id
+    assert edge.target == target.id
+    assert edge.traversal_class == "dependency-flow"
+    assert edge.intrinsic_orientation == "source_to_target"
+
+
+def test_u5_edges_keep_relation_registration_and_traversal_guards(monkeypatch):
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    source = service._add_node(
+        analysis, "code-repo", "source", {"resource_rid": "ri.source"}
+    )
+    target = service._add_node(
+        analysis, "dataset", "target", {"resource_rid": "ri.target"}
+    )
+
+    with pytest.raises(ValueError, match="unregistered relation kind"):
+        service._add_edge(
+            analysis, source.id, target.id, "not-registered", ["evidence-u5"]
+        )
+
+    service._add_edge(
+        analysis,
+        source.id,
+        target.id,
+        "code-repo-builds-dataset",
+        ["evidence-u5"],
+    )
+    monkeypatch.setitem(
+        RELATION_KINDS,
+        "code-repo-builds-dataset",
+        ("adjacent-structural", "source_to_target"),
+    )
+    with pytest.raises(ValueError, match="conflicting intrinsic relation definition"):
+        service._add_edge(
+            analysis,
+            source.id,
+            target.id,
+            "code-repo-builds-dataset",
+            ["evidence-u5-new"],
+        )
+
+
+def test_transform_dataset_surface_is_dataset_only_and_live_provider_aware():
+    assert TRANSFORM_DATASET_LINEAGE_SURFACE == "transform-dataset-lineage"
+    assert (
+        MATRIX_GAPS["dataset"][TRANSFORM_DATASET_LINEAGE_SURFACE]
+        == "unsupported-transform-dataset-lineage"
+    )
+    assert all(
+        TRANSFORM_DATASET_LINEAGE_SURFACE not in surfaces
+        for kind, surfaces in MATRIX_GAPS.items()
+        if kind != "dataset"
+    )
+
+
+def _internal_empty_coverage_record(*, operation="ACP-01"):
+    service = DependencyGraphService(client=SimpleNamespace())
+    analysis = context()
+    node = service._add_node(
+        analysis, "dataset", "dataset", {"resource_rid": "ri.dataset"}
+    )
+    record = service._coverage_record(
+        analysis,
+        "dataset",
+        TRANSFORM_DATASET_LINEAGE_SURFACE,
+        node.id,
+        operation=operation,
+        transport="conjure-rest",
+        empty_is_inconclusive=True,
+    )
+    return service, record
+
+
+@pytest.mark.parametrize(
+    ("broken_term", "broken_value"),
+    [
+        ("operation", "ACP-03"),
+        ("reason_code", "different-reason"),
+        ("positive_control_status", "not-run"),
+        ("existence_confirmed", False),
+    ],
+)
+def test_finish_coverage_rejects_internal_empty_when_one_sanction_term_is_broken(
+    broken_term, broken_value
+):
+    values = {
+        "operation": "ACP-01",
+        "reason_code": "authoritative-empty-no-producer",
+        "positive_control_status": "passed",
+        "existence_confirmed": True,
+    }
+    values[broken_term] = broken_value
+    service, record = _internal_empty_coverage_record(operation=values["operation"])
+
+    with pytest.raises(ValueError, match="internal coverage cannot be covered-empty"):
+        service._finish_coverage(
+            record,
+            "covered-empty",
+            reason_code=values["reason_code"],
+            positive_control_status=values["positive_control_status"],
+            existence_confirmed=values["existence_confirmed"],
+        )
+
+
+def test_finish_coverage_accepts_internal_empty_with_all_sanction_terms():
+    service, record = _internal_empty_coverage_record()
+
+    service._finish_coverage(
+        record,
+        "covered-empty",
+        reason="authoritative-empty-no-producer",
+        reason_code="authoritative-empty-no-producer",
+        positive_control_status="passed",
+        existence_confirmed=True,
+    )
+    assert record.status == "covered-empty"
+    assert record.reason_code == "authoritative-empty-no-producer"
 
 
 @pytest.mark.parametrize(

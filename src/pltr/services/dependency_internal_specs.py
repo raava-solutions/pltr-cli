@@ -65,6 +65,41 @@ GET_OBJECT_TYPE_DEPENDENTS_QUERY = """query GetObjectTypeDependents($rid: RID!) 
 }"""
 
 
+TRANSFORM_LINEAGE_GET_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
+    "ACP-01": InternalOperationSpec(
+        acp_id="ACP-01",
+        operation="build2.get-producing-jobspecs",
+        capability_ids=("CAP-06",),
+        transport="conjure-rest",
+        verb="GET",
+        path="/build2/api/jobspecs/datasets/{dataset_rid}",
+        coverage_surface="transform-dataset-lineage",
+        target_kind="dataset",
+        contract_pins=_PINS,
+        # Branch names are dynamic response keys. The collector validates each
+        # branch value and jobspec discriminator instead of pretending there is
+        # a static top-level field to pin here.
+        shape_descriptor={"required": ()},
+        positive_control=_config_gated_positive_control,
+    ),
+    "ACP-03": InternalOperationSpec(
+        acp_id="ACP-03",
+        operation="stemma.get-transform-source-and-blame",
+        capability_ids=("CAP-06",),
+        transport="conjure-rest",
+        verb="GET",
+        path="/stemma/api/repos/{repo_rid}/paths/contents/{path}",
+        coverage_surface="transform-dataset-lineage",
+        target_kind="dataset",
+        contract_pins=_PINS,
+        # Contents and blame are two shapes under one ACP. Their required
+        # fields are checked at the call site after transport classification.
+        shape_descriptor={"required": ()},
+        positive_control=_config_gated_positive_control,
+    ),
+}
+
+
 ACP_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
     "ACP-04": InternalOperationSpec(
         acp_id="ACP-04",
@@ -147,6 +182,19 @@ GRAPHQL_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
 
 
 CONJURE_POST_OPERATION_SPECS: dict[str, InternalOperationSpec] = {
+    "ACP-02": InternalOperationSpec(
+        acp_id="ACP-02",
+        operation="build2.walk-jobspecs",
+        capability_ids=("CAP-06",),
+        transport="conjure-rest",
+        verb="POST",
+        path=("/build2/api/jobspecs/branches/{branch}/{direction}-jobspecs"),
+        coverage_surface="transform-dataset-lineage",
+        target_kind="dataset",
+        contract_pins=_PINS,
+        shape_descriptor={"required": ()},
+        positive_control=_config_gated_positive_control,
+    ),
     "ACP-06": InternalOperationSpec(
         acp_id="ACP-06",
         operation="monocle.graph-v3",

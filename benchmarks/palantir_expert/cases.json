@@ -2,7 +2,7 @@
   "benchmark": {
     "name": "palantir-expert-v1",
     "version": "1.0",
-    "cli_contract": "pltr-cli 0.19.1",
+    "cli_contract": "pltr-cli 0.20.0",
     "headline_status": "pilot",
     "explanation_scored": false,
     "required_behaviors_scored": false

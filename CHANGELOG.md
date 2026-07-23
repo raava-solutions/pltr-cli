@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No changes yet._
 
+## [0.21.0] - 2026-07-23
+
+### Added
+
+- Added `pltr search <text>` for cross-resource search across Foundry, returning matching resources with their type and path.
+
+
 ## [0.20.0] - 2026-07-23
 
 ### Added

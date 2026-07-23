@@ -23,6 +23,10 @@ Before planning, proposing, or applying a change to a Foundry ontology resource,
 
 The assessment is read-only. It does not authorize or execute a Foundry mutation.
 
+## Documented solutions
+
+`docs/solutions/` contains documented solutions organized by category with searchable YAML frontmatter; it is relevant when implementing or debugging in documented areas.
+
 ## Skill source of truth
 
 `skills/pltr-cli/` is the single canonical skill bundle for all agent clients. Do not create provider-specific copies. Client-specific instruction files may point here for compatibility but must not duplicate these rules.

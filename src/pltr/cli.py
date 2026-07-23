@@ -42,6 +42,7 @@ from pltr.commands import (
     notepad,
 )
 from pltr.commands.cp import cp_command
+from pltr.commands.search import search_command
 
 app = typer.Typer(
     name="pltr",
@@ -139,6 +140,9 @@ app.add_typer(
     help="Inspect native agent-first Foundry capabilities",
 )
 app.add_typer(notepad.app, name="notepad", help="Read Foundry notepad contents")
+app.command("search", help="Search Foundry resources by title (read-only)")(
+    search_command
+)
 app.add_typer(shell.shell_app, name="shell", help="Interactive shell mode")
 app.add_typer(completion.app, name="completion", help="Manage shell completions")
 app.add_typer(alias.app, name="alias", help="Manage command aliases")

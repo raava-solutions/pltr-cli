@@ -7,6 +7,19 @@ from unittest.mock import patch
 
 import pytest
 
+from pltr.services.dependency import (
+    AnalysisContext,
+    ArgumentObservation,
+    DependencyGraphService,
+    OperationProvenance,
+)
+from pltr.services.dependency_internal_specs import (
+    ACP_OPERATION_SPECS,
+    CONJURE_POST_OPERATION_SPECS,
+    CONSUMER_CHARACTERIZATION_OPERATION_SPECS,
+    GRAPHQL_OPERATION_SPECS,
+    TRANSFORM_LINEAGE_GET_OPERATION_SPECS,
+)
 from pltr.utils.dependency_artifacts import (
     ArtifactWriteError,
     artifact_identity,
@@ -266,6 +279,123 @@ def test_artifact_provenance_schema_and_evidence_references_are_exact(tmp_path):
                 "server-default",
                 "not-applicable",
             }
+
+
+def test_internal_edge_evidence_round_trips_with_resolvable_transport_provenance():
+    specs = {}
+    for registry in (
+        ACP_OPERATION_SPECS,
+        TRANSFORM_LINEAGE_GET_OPERATION_SPECS,
+        CONJURE_POST_OPERATION_SPECS,
+        CONSUMER_CHARACTERIZATION_OPERATION_SPECS,
+        GRAPHQL_OPERATION_SPECS,
+    ):
+        specs.update(registry)
+    edge_operations = {
+        "code-repo-builds-dataset": ("ACP-01", "ACP-03"),
+        "transform-builds-dataset": ("ACP-01",),
+        "dataset-feeds-transform": ("ACP-01",),
+        "column-backs-property": ("ACP-04",),
+        "object-consumed-by-app": ("ACP-05", "ACP-06", "ACP-07"),
+        "object-consumed-by-workshop": ("ACP-05", "ACP-06"),
+        # ACP-05 and ACP-06 corroborate the existing structural link edge
+        # instead of inventing an internal-only relation kind.
+        "declared-link": ("ACP-05", "ACP-06"),
+    }
+    context = AnalysisContext.create(
+        profile="test",
+        host="https://example.test",
+        request_timeout_seconds=23,
+    )
+    service = DependencyGraphService(client=object())
+    observed_at = "2026-07-23T12:00:00Z"
+
+    for index, (relation_kind, acp_ids) in enumerate(edge_operations.items()):
+        source = service._add_node(
+            context,
+            "generic-resource",
+            f"source-{index}",
+            {"rid": f"source-{index}"},
+        )
+        target = service._add_node(
+            context,
+            "generic-resource",
+            f"target-{index}",
+            {"rid": f"target-{index}"},
+        )
+        evidence_ids = []
+        for acp_id in acp_ids:
+            spec = specs[acp_id]
+            operation_id = f"operation-{relation_kind}-{acp_id}"
+            context.operation_provenance[operation_id] = OperationProvenance(
+                operation_id,
+                context.read_context.id,
+                "internal",
+                spec.operation,
+                spec.capability_ids,
+                context.read_context.invocation_sdk_version,
+                observed_at,
+                observed_at,
+                ArgumentObservation("not-applicable"),
+                ArgumentObservation("not-applicable"),
+                23,
+                (),
+                transport=spec.transport,
+                acp_id=spec.acp_id,
+                http_verb=spec.verb,
+                path=spec.path,
+                contract_pins=dict(spec.contract_pins),
+                operation_name=spec.operation_name,
+                document_sha256=spec.document_sha256,
+            )
+            evidence = service._add_evidence(
+                context,
+                operation_id,
+                f"fixture[{index}].{acp_id}",
+                relation_kind,
+                {"acp_id": acp_id},
+            )
+            evidence_ids.append(evidence.id)
+        service._add_edge(
+            context,
+            source.id,
+            target.id,
+            relation_kind,
+            evidence_ids,
+        )
+
+    serialized = serialize_dependency_result(
+        {
+            "graph": {"edges": list(context.edges.values())},
+            "evidence": list(context.evidence.values()),
+            "operation_provenance": list(context.operation_provenance.values()),
+        }
+    )
+    evidence_by_id = {item["id"]: item for item in serialized["evidence"]}
+    operations_by_id = {item["id"]: item for item in serialized["operation_provenance"]}
+
+    assert {edge["relation_kind"] for edge in serialized["graph"]["edges"]} == set(
+        edge_operations
+    )
+    for edge in serialized["graph"]["edges"]:
+        assert edge["evidence_ids"]
+        observed_acp_ids = set()
+        for evidence_id in edge["evidence_ids"]:
+            operation = operations_by_id[
+                evidence_by_id[evidence_id]["operation_provenance_id"]
+            ]
+            observed_acp_ids.add(operation["acp_id"])
+            expected_spec = specs[operation["acp_id"]]
+            assert operation["acp_id"] == expected_spec.acp_id
+            assert operation["transport"] == expected_spec.transport
+            assert operation["http_verb"] == expected_spec.verb
+            assert operation["path"] == expected_spec.path
+            assert operation["request_timeout_seconds"] == 23
+            assert operation["invoked_at"] and operation["observed_at"]
+            if operation["transport"] == "graphql-sse":
+                assert operation["operation_name"] == expected_spec.operation_name
+                assert operation["document_sha256"] == expected_spec.document_sha256
+        assert observed_acp_ids == set(edge_operations[edge["relation_kind"]])
 
 
 def test_agent_block_round_trips_additively_without_losing_nested_values(tmp_path):

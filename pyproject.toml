@@ -1,6 +1,6 @@
 [project]
 name = "pltr-cli"
-version = "0.18.0"
+version = "0.19.1"
 description = "Command-line interface for Palantir Foundry APIs"
 authors = [
     { name = "anjor", email = "anjor@umd.edu" },
@@ -8,15 +8,16 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "click>=8.3.3,<8.4.0",
     "click-repl>=0.3.0",
     "foundry-platform-sdk>=1.95.0,<2.0.0",
     "keyring>=25.6.0",
     "pandas>=2.0.0",
     "pyarrow>=15.0.0",
-    "python-dotenv>=1.1.1",
-    "requests>=2.32.4",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.0",
     "rich>=14.1.0",
-    "typer>=0.16.0",
+    "typer>=0.18.0,<0.19.0",
 ]
 keywords = [
     "palantir",
@@ -71,9 +72,10 @@ packages = [
 dev = [
     "bandit>=1.8.6",
     "mypy>=1.17.1",
+    "pip-audit>=2.10.1",
     "pre-commit>=4.3.0",
     "pydocstyle>=6.3.0",
-    "pytest>=8.4.1",
+    "pytest>=9.0.3",
     "pytest-cov>=6.2.1",
     "ruff>=0.12.8",
     "tomli-w>=1.2.0",

@@ -31,7 +31,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --dev
+        uv sync --locked --dev
 
     - name: Run linting with ruff
       run: |
@@ -76,13 +76,13 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --dev
+        uv sync --locked --dev
 
     - name: Check code formatting with ruff
       run: |
         uv run ruff format --check .
 
-    - name: Run security checks (if configured)
+    - name: Audit locked runtime dependencies
       run: |
-        # Add security scanning tools here if needed
-        echo "Security checks placeholder - add tools like bandit, safety, etc."
+        uv export --locked --format requirements-txt --no-dev --no-hashes --no-emit-project --output-file "${RUNNER_TEMP}/runtime-requirements.txt"
+        uv run pip-audit --disable-pip --no-deps --strict --format json --progress-spinner off --requirement "${RUNNER_TEMP}/runtime-requirements.txt"

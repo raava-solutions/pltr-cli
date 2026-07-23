@@ -2,11 +2,14 @@
 Main CLI entry point for pltr.
 """
 
+import sys
+
 import typer
 from typing_extensions import Annotated
 
 from pltr import __version__
 from pltr.utils.agent_output import configure_agent_settings
+from pltr.utils.tracing import command_paths_for_app, run_with_tracing
 from pltr.commands import (
     configure,
     verify,
@@ -191,5 +194,14 @@ def hello():
     typer.echo("CLI is working correctly.")
 
 
+def main_entrypoint() -> None:
+    """Run the installed CLI entrypoint with optional tracing."""
+    run_with_tracing(
+        sys.argv[1:],
+        app,
+        command_paths=command_paths_for_app(app),
+    )
+
+
 if __name__ == "__main__":
-    app()
+    main_entrypoint()

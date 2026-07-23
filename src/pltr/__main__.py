@@ -22,10 +22,10 @@ if "_PLTR_COMPLETE" in os.environ:
     sys.exit(exit_code)
 
 # Normal CLI execution
-from pltr.cli import app
+from pltr.cli import main_entrypoint
 from pltr.utils.alias_resolver import inject_alias_resolution
 
 if __name__ == "__main__":
     # Resolve aliases before running the app
     inject_alias_resolution()
-    app()
+    main_entrypoint()

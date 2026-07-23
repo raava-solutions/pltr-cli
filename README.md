@@ -463,6 +463,19 @@ export FOUNDRY_HOST="foundry.company.com"
 
 See **[Authentication Setup](docs/user-guide/authentication.md)** for complete configuration options.
 
+### Optional Langfuse CLI tracing
+
+Install the optional extra and set all three variables to trace command paths, redacted arguments, duration, and exit codes:
+
+```bash
+uv pip install "pltr-cli[langfuse]"
+export LANGFUSE_HOST="https://cloud.langfuse.com"
+export LANGFUSE_PUBLIC_KEY="pk-lf-..."
+export LANGFUSE_SECRET_KEY="sk-lf-..."
+```
+
+Tracing is disabled when the variables are absent, and tracing failures never change the command result.
+
 ## 🔧 Development
 
 ### Prerequisites

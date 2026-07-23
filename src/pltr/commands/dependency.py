@@ -41,6 +41,10 @@ DEFAULT_MAX_ITEMS = 10_000
 DEFAULT_MAX_NODES = 150
 DEFAULT_MAX_DEPTH = 2
 DEFAULT_TIME_BUDGET_SECONDS = 60.0
+DEFAULT_INTERNAL_PROVIDERS = frozenset({"sdk", "conjure", "graphql"})
+SDK_ONLY_PROVIDERS = frozenset({"sdk"})
+PROVIDER_NAMES = ("sdk", "conjure", "graphql")
+INTERNAL_TRANSPORTS = frozenset({"conjure-rest", "graphql-sse"})
 
 HARD_CEILINGS = {
     "max_requests": 1_000,
@@ -82,6 +86,64 @@ class _ComparisonArtifactError(ValueError):
 
     error_class = "invalid-invocation"
     retryable = False
+
+
+def _selected_providers(
+    providers: Optional[str],
+    *,
+    no_internal: bool,
+    internal_default: bool,
+) -> frozenset[str]:
+    """Resolve CLI provider selection without weakening the SDK authority path."""
+    if no_internal:
+        return SDK_ONLY_PROVIDERS
+    if providers is None:
+        return DEFAULT_INTERNAL_PROVIDERS if internal_default else SDK_ONLY_PROVIDERS
+    selected = frozenset(part.strip().lower() for part in providers.split(","))
+    unknown = selected.difference(PROVIDER_NAMES)
+    if "" in selected or unknown:
+        detail = ", ".join(sorted(unknown or {""})) or "empty provider"
+        raise typer.BadParameter(
+            f"unknown provider selection {detail!r}; choose from: "
+            f"{', '.join(PROVIDER_NAMES)}",
+            param_hint="--providers",
+        )
+    if "sdk" not in selected:
+        raise typer.BadParameter(
+            "must include sdk because target resolution and authoritative "
+            "structure use the public SDK",
+            param_hint="--providers",
+        )
+    return selected
+
+
+def _normalize_internal_degradation(
+    result: dict[str, Any], *, internal_enabled: bool
+) -> None:
+    """Keep internal transport failures fail-closed at the command boundary.
+
+    The shared SDK classifier uses ``partial`` for retryable connection and
+    timeout failures. Internal providers cannot make the same claim: no
+    internal response means absence was not tested, so their records and gaps
+    must render as ``inconclusive``.
+    """
+    if not internal_enabled:
+        return
+
+    for record in result.get("coverage", result.get("coverage_records", ())):
+        if (
+            isinstance(record, dict)
+            and record.get("transport") in INTERNAL_TRANSPORTS
+            and record.get("status") == "partial"
+        ):
+            record["status"] = "inconclusive"
+    for gap in result.get("gaps", ()):
+        if (
+            isinstance(gap, dict)
+            and str(gap.get("operation", "")).startswith("ACP-")
+            and gap.get("coverage") == "partial"
+        ):
+            gap["coverage"] = "inconclusive"
 
 
 def _validate_options(
@@ -335,7 +397,10 @@ def _run(
     change_type: Optional[str | ChangeType] = None,
     output_mode: str | OutputMode = "graph",
     compare_artifact: Optional[Path] = None,
-    internal_enabled: bool = False,
+    providers: Optional[str] = None,
+    no_internal: bool = False,
+    positive_controls: bool = False,
+    internal_default: bool = False,
 ) -> None:
     change_type_value = (
         change_type.value if isinstance(change_type, ChangeType) else change_type
@@ -355,6 +420,11 @@ def _run(
         change_type=change_type_value,
         output_mode=output_mode_value,
     )
+    selected_providers = _selected_providers(
+        providers,
+        no_internal=no_internal,
+        internal_default=internal_default,
+    )
     if graph_output is not None:
         _validate_output_paths(output, graph_output)
     try:
@@ -373,10 +443,24 @@ def _run(
             time_budget_seconds=time_budget_seconds,
         )
         service_kwargs: dict[str, Any] = {"profile": effective_profile}
-        if internal_enabled:
+        internal_client: Optional[FoundryInternalClient] = None
+        bootstrap_provider: Optional[ConjureRestProvider] = None
+        if selected_providers.intersection({"conjure", "graphql"}):
             internal_client = FoundryInternalClient(effective_profile)
-            service_kwargs["conjure_provider"] = ConjureRestProvider(internal_client)
+            # U9 supplies the ACP implementations; U8 carries the explicit
+            # command gate on the one shared client without enabling controls
+            # for ordinary invocations.
+            setattr(internal_client, "positive_controls_enabled", positive_controls)
+            bootstrap_provider = ConjureRestProvider(internal_client)
+            service_kwargs["conjure_provider"] = bootstrap_provider
         service = DependencyGraphService(**service_kwargs)
+        if internal_client is not None:
+            service._conjure_provider = (
+                bootstrap_provider if "conjure" in selected_providers else None
+            )
+            service._graphql_client = (
+                internal_client if "graphql" in selected_providers else None
+            )
         context = service.create_context(
             host=host,
             ontology_rid=ontology_rid,
@@ -394,6 +478,12 @@ def _run(
             compare_artifact=baseline_artifact,
         )
         result = serialize_dependency_result(raw_result)
+        _normalize_internal_degradation(
+            result,
+            internal_enabled=bool(
+                selected_providers.intersection({"conjure", "graphql"})
+            ),
+        )
         analysis_id, _ = artifact_identity(result)
         artifact_path = graph_output or default_artifact_path(analysis_id)
         _validate_output_paths(output, artifact_path)
@@ -508,6 +598,16 @@ def object_type(
     no_internal: bool = typer.Option(
         False, "--no-internal", help="Use SDK-only dependency discovery"
     ),
+    providers: Optional[str] = typer.Option(
+        None,
+        "--providers",
+        help="Comma-separated subset: sdk,conjure,graphql",
+    ),
+    positive_controls: bool = typer.Option(
+        False,
+        "--positive-controls",
+        help="Enable config-gated internal ACP canaries",
+    ),
 ) -> None:
     """Analyze an ontology object type."""
     _run(
@@ -532,7 +632,10 @@ def object_type(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
-        internal_enabled=not no_internal,
+        providers=providers,
+        no_internal=no_internal,
+        positive_controls=positive_controls,
+        internal_default=True,
     )
 
 
@@ -567,6 +670,16 @@ def property_command(
     no_internal: bool = typer.Option(
         False, "--no-internal", help="Use SDK-only dependency discovery"
     ),
+    providers: Optional[str] = typer.Option(
+        None,
+        "--providers",
+        help="Comma-separated subset: sdk,conjure,graphql",
+    ),
+    positive_controls: bool = typer.Option(
+        False,
+        "--positive-controls",
+        help="Enable config-gated internal ACP canaries",
+    ),
 ) -> None:
     """Analyze one property on an ontology object type."""
     _run(
@@ -591,7 +704,10 @@ def property_command(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
-        internal_enabled=not no_internal,
+        providers=providers,
+        no_internal=no_internal,
+        positive_controls=positive_controls,
+        internal_default=True,
     )
 
 
@@ -623,6 +739,19 @@ def link_type(
         DEFAULT_TIME_BUDGET_SECONDS, "--time-budget-seconds"
     ),
     full: bool = typer.Option(False, "--full"),
+    no_internal: bool = typer.Option(
+        False, "--no-internal", help="Use SDK-only dependency discovery"
+    ),
+    providers: Optional[str] = typer.Option(
+        None,
+        "--providers",
+        help="Comma-separated subset: sdk,conjure,graphql",
+    ),
+    positive_controls: bool = typer.Option(
+        False,
+        "--positive-controls",
+        help="Enable config-gated internal ACP canaries",
+    ),
 ) -> None:
     """Analyze an ontology link type."""
     _run(
@@ -647,6 +776,9 @@ def link_type(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
+        providers=providers,
+        no_internal=no_internal,
+        positive_controls=positive_controls,
     )
 
 
@@ -677,6 +809,19 @@ def action_type(
         DEFAULT_TIME_BUDGET_SECONDS, "--time-budget-seconds"
     ),
     full: bool = typer.Option(False, "--full"),
+    no_internal: bool = typer.Option(
+        False, "--no-internal", help="Use SDK-only dependency discovery"
+    ),
+    providers: Optional[str] = typer.Option(
+        None,
+        "--providers",
+        help="Comma-separated subset: sdk,conjure,graphql",
+    ),
+    positive_controls: bool = typer.Option(
+        False,
+        "--positive-controls",
+        help="Enable config-gated internal ACP canaries",
+    ),
 ) -> None:
     """Analyze an ontology action type using full metadata."""
     _run(
@@ -701,6 +846,9 @@ def action_type(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
+        providers=providers,
+        no_internal=no_internal,
+        positive_controls=positive_controls,
     )
 
 
@@ -731,6 +879,19 @@ def query_type(
         DEFAULT_TIME_BUDGET_SECONDS, "--time-budget-seconds"
     ),
     full: bool = typer.Option(False, "--full"),
+    no_internal: bool = typer.Option(
+        False, "--no-internal", help="Use SDK-only dependency discovery"
+    ),
+    providers: Optional[str] = typer.Option(
+        None,
+        "--providers",
+        help="Comma-separated subset: sdk,conjure,graphql",
+    ),
+    positive_controls: bool = typer.Option(
+        False,
+        "--positive-controls",
+        help="Enable config-gated internal ACP canaries",
+    ),
 ) -> None:
     """Analyze an ontology query type."""
     _run(
@@ -755,6 +916,9 @@ def query_type(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
+        providers=providers,
+        no_internal=no_internal,
+        positive_controls=positive_controls,
     )
 
 
@@ -784,6 +948,19 @@ def resource(
         DEFAULT_TIME_BUDGET_SECONDS, "--time-budget-seconds"
     ),
     full: bool = typer.Option(False, "--full"),
+    no_internal: bool = typer.Option(
+        False, "--no-internal", help="Use SDK-only dependency discovery"
+    ),
+    providers: Optional[str] = typer.Option(
+        None,
+        "--providers",
+        help="Comma-separated subset: sdk,conjure,graphql",
+    ),
+    positive_controls: bool = typer.Option(
+        False,
+        "--positive-controls",
+        help="Enable config-gated internal ACP canaries",
+    ),
 ) -> None:
     """Analyze a Compass RID, specializing datasets and applications when resolved."""
     if not resource_rid.startswith("ri."):
@@ -811,4 +988,8 @@ def resource(
         change_type=change_type,
         output_mode=output_mode,
         compare_artifact=compare_artifact,
+        providers=providers,
+        no_internal=no_internal,
+        positive_controls=positive_controls,
+        internal_default=True,
     )

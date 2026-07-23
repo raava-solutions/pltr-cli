@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from click.utils import strip_ansi
 import pytest
+import requests
 from typer.testing import CliRunner
 
 from pltr.cli import app
@@ -307,7 +308,7 @@ def service():
             "resolve_resource",
             ("ri.foundry.main.dataset.abc",),
             None,
-            False,
+            True,
         ),
     ],
 )
@@ -588,7 +589,10 @@ def test_active_profile_and_non_secret_host_are_resolved_once(tmp_path):
     assert result.exit_code == 0, result.output
     auth_manager.get_current_profile.assert_called_once_with()
     auth_manager.storage.get_profile.assert_called_once_with("prod")
-    constructor.assert_called_once_with(profile="prod")
+    constructor.assert_called_once()
+    constructor_kwargs = constructor.call_args.kwargs
+    assert constructor_kwargs["profile"] == "prod"
+    assert constructor_kwargs["conjure_provider"].client.profile == "prod"
     create_kwargs = service_instance.create_context.call_args.kwargs
     assert create_kwargs["host"] == "https://prod.example.com/"
     assert "secret-token" not in repr(create_kwargs)
@@ -1206,6 +1210,7 @@ def test_no_internal_preserves_sdk_only_graph_and_constructs_no_internal_client(
 ):
     constructor, instance, _, _ = service
     expected = analysis_result()
+    expected["coverage_records"] = [{"surface": "query-metadata", "status": "partial"}]
     instance.analyze.return_value = expected
     with (
         patch("pltr.commands.dependency.FoundryInternalClient") as internal_client,
@@ -1235,10 +1240,446 @@ def test_no_internal_preserves_sdk_only_graph_and_constructs_no_internal_client(
     constructor.assert_called_once_with(profile="qa")
     rendered = json.loads(result.output)
     assert rendered["graph"] == expected["graph"]
+    assert rendered["coverage_records"] == expected["coverage_records"]
     assert all(
         operation.get("transport", "sdk") == "sdk"
         for operation in rendered["operation_provenance"]
     )
+    assert (
+        json.loads((tmp_path / "graph.json").read_text())["graph"] == expected["graph"]
+    )
+
+
+@pytest.mark.parametrize("positive_controls", [False, True])
+def test_positive_controls_configure_the_shared_internal_client_once(
+    tmp_path, service, positive_controls
+):
+    _, _, _, _ = service
+    with patch("pltr.commands.dependency.FoundryInternalClient") as client_constructor:
+        arguments = [
+            "dependency",
+            "object-type",
+            "ri.ontology",
+            "Employee",
+            "--profile",
+            "qa",
+            "--graph-output",
+            str(tmp_path / f"controls-{positive_controls}.json"),
+        ]
+        if positive_controls:
+            arguments.append("--positive-controls")
+        result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 0, result.output
+    client_constructor.assert_called_once_with("qa")
+    assert (
+        client_constructor.return_value.positive_controls_enabled is positive_controls
+    )
+
+
+def test_sdk_conjure_subset_never_invokes_graphql_and_records_no_graphql_provenance(
+    tmp_path,
+):
+    graph_path = tmp_path / "conjure-only.json"
+    sdk_client = _internal_edge_sdk_client()
+    sdk_client.ontologies.Ontology.ObjectType.get_full_metadata.return_value.object_type.rid = "ri.ontology.main.object-type.employee"
+    internal_client = Mock()
+    internal_client.conjure.return_value = (200, {"datasources": []}, "{}")
+
+    def build_service(*, profile, conjure_provider=None):
+        assert profile == "qa"
+        return RealDependencyGraphService(
+            client=sdk_client,
+            conjure_provider=conjure_provider,
+        )
+
+    with (
+        patch("pltr.commands.dependency.AuthManager") as auth_constructor,
+        patch(
+            "pltr.commands.dependency.DependencyGraphService",
+            side_effect=build_service,
+        ),
+        patch(
+            "pltr.commands.dependency.FoundryInternalClient",
+            return_value=internal_client,
+        ) as client_constructor,
+    ):
+        auth_constructor.return_value.storage.get_profile.return_value = {
+            "host": "https://qa.example.com",
+            "token": "command-token",
+        }
+        result = runner.invoke(
+            app,
+            [
+                "dependency",
+                "object-type",
+                "ri.ontology",
+                "Employee",
+                "--profile",
+                "qa",
+                "--providers",
+                "sdk,conjure",
+                "--format",
+                "json",
+                "--graph-output",
+                str(graph_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    client_constructor.assert_called_once_with("qa")
+    internal_client.conjure.assert_called_once()
+    internal_client.graphql.assert_not_called()
+    artifact = json.loads(graph_path.read_text())
+    transports = {
+        operation.get("transport", "sdk")
+        for operation in artifact["operation_provenance"]
+    }
+    assert "conjure-rest" in transports
+    assert "graphql-sse" not in transports
+
+
+@pytest.mark.parametrize(
+    ("providers", "conjure_enabled", "graphql_enabled"),
+    [
+        ("sdk,conjure", True, False),
+        ("sdk,graphql", False, True),
+        ("sdk,conjure,graphql", True, True),
+    ],
+)
+def test_provider_subset_configures_only_selected_internal_transports(
+    tmp_path, service, providers, conjure_enabled, graphql_enabled
+):
+    constructor, instance, _, _ = service
+    payload = analysis_result()
+    if conjure_enabled:
+        payload["operation_provenance"].append(
+            {
+                "id": "op-conjure",
+                "transport": "conjure-rest",
+                "acp_id": "ACP-04",
+            }
+        )
+    if graphql_enabled:
+        payload["operation_provenance"].append(
+            {
+                "id": "op-graphql",
+                "transport": "graphql-sse",
+                "acp_id": "ACP-05",
+            }
+        )
+    instance.analyze.return_value = payload
+    with (
+        patch("pltr.commands.dependency.FoundryInternalClient") as client_constructor,
+        patch("pltr.commands.dependency.ConjureRestProvider") as provider_constructor,
+    ):
+        internal_client = client_constructor.return_value
+        provider = provider_constructor.return_value
+        result = runner.invoke(
+            app,
+            [
+                "dependency",
+                "object-type",
+                "ri.ontology",
+                "Employee",
+                "--profile",
+                "qa",
+                "--providers",
+                providers,
+                "--format",
+                "json",
+                "--graph-output",
+                str(tmp_path / "graph.json"),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    client_constructor.assert_called_once_with("qa")
+    provider_constructor.assert_called_once_with(internal_client)
+    constructor.assert_called_once_with(profile="qa", conjure_provider=provider)
+    assert (instance._conjure_provider is provider) is conjure_enabled
+    assert (instance._graphql_client is internal_client) is graphql_enabled
+    artifact = json.loads((tmp_path / "graph.json").read_text())
+    transports = {
+        operation.get("transport", "sdk")
+        for operation in artifact["operation_provenance"]
+    }
+    expected = {"sdk"}
+    if conjure_enabled:
+        expected.add("conjure-rest")
+    if graphql_enabled:
+        expected.add("graphql-sse")
+    assert transports == expected
+
+
+@pytest.mark.parametrize("providers", ["", "sdk,unknown", "conjure,graphql"])
+def test_invalid_provider_subset_fails_before_internal_provider_construction(
+    tmp_path, providers
+):
+    with (
+        patch("pltr.commands.dependency.FoundryInternalClient") as internal_client,
+        patch("pltr.commands.dependency.DependencyGraphService") as service_constructor,
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "dependency",
+                "object-type",
+                "ri.ontology",
+                "Employee",
+                "--providers",
+                providers,
+                "--graph-output",
+                str(tmp_path / "graph.json"),
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "--providers" in strip_ansi(result.output)
+    internal_client.assert_not_called()
+    service_constructor.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("format_type", "full"),
+    [("table", False), ("table", True), ("json", False), ("csv", False)],
+)
+def test_each_rendering_mode_analyzes_and_writes_artifact_once(
+    tmp_path, service, format_type, full
+):
+    _, instance, _, _ = service
+    graph_path = tmp_path / f"{format_type}-{full}.json"
+    real_writer = dependency_command.write_dependency_artifact
+    with patch(
+        "pltr.commands.dependency.write_dependency_artifact", wraps=real_writer
+    ) as writer:
+        arguments = [
+            "dependency",
+            "resource",
+            "ri.foundry.main.dataset.abc",
+            "--format",
+            format_type,
+            "--graph-output",
+            str(graph_path),
+        ]
+        if full:
+            arguments.append("--full")
+        result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 0, result.output
+    instance.create_context.assert_called_once()
+    instance.analyze.assert_called_once()
+    writer.assert_called_once()
+
+
+def _internal_rendering_result() -> dict:
+    payload = analysis_result()
+    payload["graph"]["nodes"].extend(
+        [
+            {"id": "app:payroll", "kind": "application"},
+            {"id": "workshop:payroll", "kind": "workshop-module"},
+            {"id": "transform:payroll", "kind": "transform"},
+            {"id": "repo:payroll", "kind": "code-repository"},
+            {"id": "dataset:payroll", "kind": "dataset"},
+        ]
+    )
+    payload["graph"]["edges"].extend(
+        [
+            {
+                "id": "edge-app",
+                "source": "object:Employee",
+                "target": "app:payroll",
+                "relation_kind": "object-consumed-by-app",
+                "evidence_ids": ["ev-graphql"],
+                "attributes": {
+                    "consumer_osdk_impact": {
+                        "oldest": "0.4.0",
+                        "latest": "0.6.0",
+                    }
+                },
+            },
+            {
+                "id": "edge-workshop",
+                "source": "object:Employee",
+                "target": "workshop:payroll",
+                "relation_kind": "object-consumed-by-workshop",
+                "evidence_ids": ["ev-graphql"],
+            },
+            {
+                "id": "edge-transform",
+                "source": "transform:payroll",
+                "target": "dataset:payroll",
+                "relation_kind": "transform-builds-dataset",
+                "evidence_ids": ["ev-conjure"],
+            },
+            {
+                "id": "edge-lineage",
+                "source": "repo:payroll",
+                "target": "dataset:payroll",
+                "relation_kind": "code-repo-builds-dataset",
+                "evidence_ids": ["ev-conjure"],
+            },
+        ]
+    )
+    payload["ranked_relationships"] = [
+        {
+            "readable_path": "Employee -> Payroll app (OSDK 0.4.0-0.6.0)",
+            "direction": "downstream",
+            "relation_kind": "object-consumed-by-app",
+            "evidence_summary": {
+                "locator": "objectTypeV2.dependents.values[0]",
+                "transport": "graphql-sse",
+                "acp_id": "ACP-05",
+            },
+        },
+        {
+            "readable_path": "Employee -> Payroll workshop",
+            "direction": "downstream",
+            "relation_kind": "object-consumed-by-workshop",
+            "evidence_summary": {
+                "locator": "objectTypeV2.dependents.values[1]",
+                "transport": "graphql-sse",
+                "acp_id": "ACP-05",
+            },
+        },
+        {
+            "readable_path": "Payroll transform -> Payroll dataset",
+            "direction": "downstream",
+            "relation_kind": "transform-builds-dataset",
+            "evidence_summary": {
+                "locator": "jobspec.outputs[0]",
+                "transport": "conjure-rest",
+                "acp_id": "ACP-01",
+            },
+        },
+        {
+            "readable_path": "Payroll repo -> Payroll dataset",
+            "direction": "downstream",
+            "relation_kind": "code-repo-builds-dataset",
+            "evidence_summary": {
+                "locator": "transforms.py:10-14",
+                "transport": "conjure-rest",
+                "acp_id": "ACP-03",
+            },
+        },
+    ]
+    payload["gaps"] = [
+        {
+            "surface": "object-type-consumers",
+            "coverage": "inconclusive",
+            "reason_code": "route-not-mounted",
+            "message": "Internal route is not mounted.",
+            "operation": "ACP-05",
+        },
+        {
+            "surface": "schedule-reverse-index",
+            "coverage": "partial",
+            "reason_code": "schedule-index-may-be-stale",
+            "message": "Schedule index is stale.",
+        },
+    ]
+    payload["operation_provenance"].extend(
+        [
+            {
+                "id": "op-conjure",
+                "transport": "conjure-rest",
+                "acp_id": "ACP-03",
+            },
+            {
+                "id": "op-graphql",
+                "transport": "graphql-sse",
+                "acp_id": "ACP-05",
+            },
+        ]
+    )
+    return payload
+
+
+@pytest.mark.parametrize("format_type", ["table", "json", "csv"])
+def test_internal_edges_provenance_and_gap_severity_render_in_every_format(
+    tmp_path, service, format_type
+):
+    _, instance, _, _ = service
+    instance.analyze.return_value = _internal_rendering_result()
+    result = runner.invoke(
+        app,
+        [
+            "dependency",
+            "object-type",
+            "ri.ontology",
+            "Employee",
+            "--format",
+            format_type,
+            "--full",
+            "--graph-output",
+            str(tmp_path / f"{format_type}.json"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    if format_type == "table":
+        output = strip_ansi(result.output)
+        assert "object-consumed-by-app" in output
+        assert "object-consumed-by-workshop" in output
+        assert "transform-builds-dataset" in output
+        assert "code-repo-builds-dataset" in output
+        assert "OSDK 0.4.0-0.6.0" in output
+        assert "graphql-sse ACP-05" in output
+        assert "inconclusive:route-not-mounted" in output
+        assert "partial:schedule-index-may-be-stale" in output
+    elif format_type == "json":
+        document = json.loads(result.output)
+        assert {edge.get("relation_kind") for edge in document["graph"]["edges"]} >= {
+            "object-consumed-by-app",
+            "object-consumed-by-workshop",
+            "transform-builds-dataset",
+            "code-repo-builds-dataset",
+        }
+        app_edge = next(
+            edge
+            for edge in document["graph"]["edges"]
+            if edge.get("relation_kind") == "object-consumed-by-app"
+        )
+        assert app_edge["attributes"]["consumer_osdk_impact"] == {
+            "oldest": "0.4.0",
+            "latest": "0.6.0",
+        }
+        assert {
+            operation.get("transport") for operation in document["operation_provenance"]
+        } >= {"conjure-rest", "graphql-sse"}
+        assert {gap["coverage"] for gap in document["gaps"]} == {
+            "inconclusive",
+            "partial",
+        }
+    else:
+        rows = list(csv.DictReader(StringIO(result.output)))
+        edge_records = {
+            json.loads(row["record"]).get("relation_kind")
+            for row in rows
+            if row["row_kind"] == "edge"
+        }
+        gap_records = [
+            json.loads(row["record"]) for row in rows if row["row_kind"] == "gap"
+        ]
+        provenance_records = [
+            json.loads(row["record"])
+            for row in rows
+            if row["row_kind"] == "operation-provenance"
+        ]
+        assert edge_records >= {
+            "object-consumed-by-app",
+            "object-consumed-by-workshop",
+            "transform-builds-dataset",
+            "code-repo-builds-dataset",
+        }
+        assert {gap["coverage"] for gap in gap_records} == {
+            "inconclusive",
+            "partial",
+        }
+        assert {record.get("transport") for record in provenance_records} >= {
+            "conjure-rest",
+            "graphql-sse",
+        }
 
 
 @pytest.mark.parametrize(
@@ -1319,6 +1760,74 @@ def test_mocked_internal_http_degradation_exits_zero_with_sdk_graph(
         for edge in artifact["graph"]["edges"]
     )
     assert any(gap["reason_code"] == reason for gap in artifact["gaps"])
+
+
+def test_internal_connection_error_degrades_to_inconclusive_with_sdk_graph(tmp_path):
+    graph_path = tmp_path / "connection.json"
+
+    def build_service(*, profile, conjure_provider=None):
+        assert profile == "qa"
+        return RealDependencyGraphService(
+            client=_internal_edge_sdk_client(),
+            conjure_provider=conjure_provider,
+        )
+
+    with (
+        patch("pltr.commands.dependency.AuthManager") as auth_constructor,
+        patch(
+            "pltr.commands.dependency.DependencyGraphService",
+            side_effect=build_service,
+        ),
+        patch(
+            "pltr.services.foundry_internal_client.CredentialStorage"
+        ) as credential_storage,
+        patch(
+            "pltr.services.foundry_internal_client.requests.request",
+            side_effect=requests.ConnectionError("endpoint unreachable"),
+        ) as request,
+    ):
+        auth_constructor.return_value.storage.get_profile.return_value = {
+            "host": "https://qa.example.com",
+            "token": "command-token",
+        }
+        credential_storage.return_value.get_profile.return_value = {
+            "host": "https://qa.example.com",
+            "token": "request-token",
+        }
+        result = runner.invoke(
+            app,
+            [
+                "dependency",
+                "property",
+                "ri.ontology",
+                "Employee",
+                "email",
+                "--profile",
+                "qa",
+                "--graph-output",
+                str(graph_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "inconclusive:connection" in strip_ansi(result.output)
+    request.assert_called_once()
+    artifact = json.loads(graph_path.read_text())
+    assert any(
+        edge["relation_kind"] == "container-member"
+        and edge["target"] == artifact["target"]["node_id"]
+        for edge in artifact["graph"]["edges"]
+    )
+    connection_gap = next(
+        gap for gap in artifact["gaps"] if gap["reason_code"] == "connection"
+    )
+    assert connection_gap["coverage"] == "inconclusive"
+    connection_coverage = next(
+        record
+        for record in artifact["coverage"]
+        if record["operation"] == "ACP-04" and record["transport"] == "conjure-rest"
+    )
+    assert connection_coverage["status"] == "inconclusive"
 
 
 def test_internal_column_edge_renders_in_compact_and_json_with_transport(
